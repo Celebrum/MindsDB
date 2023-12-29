@@ -8,6 +8,7 @@ try:
 
     import_error = None
 except Exception as e:
+    print(f'ERROR import lightwood handler: {e}')
     Handler = None
     import_error = e
 
