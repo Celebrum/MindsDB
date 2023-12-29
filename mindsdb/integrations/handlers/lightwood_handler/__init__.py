@@ -12,7 +12,11 @@ try:
     logger.error('LIGHTWOOD imported')
     import_error = None
 except Exception as e:
+    import type_infer
+    import dataprep_ml
     logger.error(f'LIGHTWOOD error {e}')
+    print(f'type_infer version {type_infer.__version__}')
+    print(f'dataprep_ml version {dataprep_ml.__version__}')
     print(f'ERROR import lightwood handler: {e}')  # noqa
     Handler = None
     import_error = e
