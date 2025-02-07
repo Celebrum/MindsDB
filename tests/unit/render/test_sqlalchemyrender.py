@@ -79,7 +79,7 @@ class TestRender:
 
     def test_extra_cast_in_division(self):
         sql = """
-           select a / b from table1
+           select a / b as col1 from table1
         """
 
         query = parse_sql(sql)
@@ -88,12 +88,39 @@ class TestRender:
         # check queries are the same after render
         assert str(query) == str(parse_sql(rendered))
 
-    def test_quoted_case(self):
+    def test_quoted_mixed_case(self):
 
-        query = Select(targets=[Identifier('Test')])
+        query = Select(targets=[Identifier('Test', alias=Identifier('Test2'))])
         rendered = SqlalchemyRender('postgres').get_string(query, with_failback=False)
-        assert rendered == 'SELECT Test'
+        assert rendered == 'SELECT Test AS Test2'
 
         query = Select(targets=[Identifier('table')])
         rendered = SqlalchemyRender('postgres').get_string(query, with_failback=False)
         assert rendered == 'SELECT "table"'
+
+    def test_star_in_path(self):
+        sql = "select t.* from table t"
+
+        query = parse_sql(sql)
+        rendered = SqlalchemyRender('postgres').get_string(query, with_failback=False)
+
+        # check queries are the same after render
+        assert str(query) == str(parse_sql(rendered))
+
+    def test_div(self):
+
+        sql0 = 'select 1 / 2 - (9 / 4 - 1) * 3 as x'
+        query = parse_sql(sql0)
+
+        sql = SqlalchemyRender('postgres').get_string(query, with_failback=False)
+
+        assert sql.lower() == sql0
+
+    def test_quoted_identifier(self):
+        sql = "SELECT `A`.*, A.`B` FROM Tbl.`Tab` AS t"
+
+        query = parse_sql(sql)
+        rendered = SqlalchemyRender('postgres').get_string(query, with_failback=False)
+
+        # check queries are the same after render
+        assert rendered.replace('\n', '') == 'SELECT "A".*, A."B" FROM Tbl."Tab" AS t'

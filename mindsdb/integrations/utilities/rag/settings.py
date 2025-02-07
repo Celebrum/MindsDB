@@ -68,19 +68,217 @@ Answer:'''
 
 DEFAULT_MAP_PROMPT_TEMPLATE = '''The following is a set of documents
 {docs}
-Based on this list of docs, please identify the main themes
+Based on this list of docs, please summarize based on the user input.
+
+User input: {input}
+
 Helpful Answer:'''
 
 DEFAULT_REDUCE_PROMPT_TEMPLATE = '''The following is set of summaries:
 {docs}
-Take these and distill it into a final, consolidated summary of the main themes.
+Take these and distill it into a final, consolidated summary related to the user input.
+
+User input: {input}
+
 Helpful Answer:'''
+
+DEFAULT_SEMANTIC_PROMPT_TEMPLATE = '''Provide a better search query for web search engine to answer the given question.
+
+<< EXAMPLES >>
+1. Input: "Show me documents containing how to finetune a LLM please"
+Output: "how to finetune a LLM"
+
+Output only a single better search query and nothing else like in the example.
+
+Here is the user input: {input}
+'''
+
+DEFAULT_METADATA_FILTERS_PROMPT_TEMPLATE = '''Construct a list of PostgreSQL metadata filters to filter documents in the database based on the user input.
+
+<< INSTRUCTIONS >>
+{format_instructions}
+
+RETURN ONLY THE FINAL JSON. DO NOT EXPLAIN, JUST RETURN THE FINAL JSON.
+
+<< TABLES YOU HAVE ACCESS TO >>
+
+{schema}
+
+<< EXAMPLES >>
+
+{examples}
+
+Here is the user input:
+{input}
+'''
+
+DEFAULT_SQL_PROMPT_TEMPLATE = '''
+Construct a valid {dialect} SQL query to select documents relevant to the user input.
+Source documents are found in the {source_table} table. You may need to join with other tables to get additional document metadata.
+
+The JSON col "metadata" in the {embeddings_table} has a string field called "original_row_id". This "original_row_id" string field in the
+"metadata" col is the document ID associated with a row in the {embeddings_table} table.
+You MUST always join with the {embeddings_table} table containing vector embeddings for the documents. For example, for a table named sd with an id column "Id":
+JOIN {embeddings_table} v ON (v."metadata"->>'original_row_id')::int = sd."Id"
+
+You MUST always order the embeddings by the {distance_function} comparator with '{{embeddings}}'.
+You MUST always limit by {k} returned documents.
+For example:
+ORDER BY v.embeddings {distance_function} '{{embeddings}}' LIMIT {k};
+
+
+<< TABLES YOU HAVE ACCESS TO >>
+1. {embeddings_table} - Contains document chunks, vector embeddings, and metadata for documents.
+You MUST always include the metadata column in your SELECT statement.
+You MUST always join with the {embeddings_table} table containing vector embeddings for the documents.
+You MUST always order by the provided embeddings vector using the {distance_function} comparator.
+You MUST always limit by {k} returned documents.
+
+Columns:
+```json
+{{
+    "id": {{
+        "type": "string",
+        "description": "Unique ID for this document chunk"
+    }},
+    "content": {{
+        "type": "string",
+        "description": "A document chunk (subset of the original document)"
+    }},
+    "embeddings": {{
+        "type": "vector",
+        "description": "Vector embeddings for the document chunk. ALWAYS order by the provided embeddings vector using the {distance_function} comparator."
+    }},
+    "metadata": {{
+        "type": "jsonb",
+        "description": "Metadata for the document chunk. Always select metadata and always join with the {source_table} table on the string metadata field 'original_row_id'"
+    }}
+}}
+
+{schema}
+
+<< EXAMPLES >>
+
+{examples}
+
+Output the {dialect} SQL query that is ready to be executed only WITHOUT ANY DELIMITERS. Make sure to properly quote identifiers.
+
+Here is the user input:
+{input}
+'''
+
+DEFAULT_QUESTION_REFORMULATION_TEMPLATE = """Given the original question and the retrieved context,
+analyze what additional information is needed for a complete, accurate answer.
+
+Original Question: {question}
+
+Retrieved Context:
+{context}
+
+Analysis Instructions:
+1. Evaluate Context Coverage:
+   - Identify key entities and concepts from the question
+   - Check for temporal information (dates, periods, sequences)
+   - Verify causal relationships are explained
+   - Confirm presence of requested quantitative data
+   - Assess if geographic or spatial context is sufficient
+
+2. Quality Assessment:
+   If the retrieved context is:
+   - Irrelevant or tangential
+   - Too general or vague
+   - Potentially contradictory
+   - Missing key perspectives
+   - Lacking proper evidence
+   Generate questions to address these specific gaps.
+
+3. Follow-up Question Requirements:
+   - Questions must directly contribute to answering the original query
+   - Break complex relationships into simpler, sequential steps
+   - Maintain specificity rather than broad inquiries
+   - Avoid questions answerable from existing context
+   - Ensure questions build on each other logically
+   - Limit questions to 150 characters each
+   - Each question must be self-contained
+   - Questions must end with a question mark
+
+4. Response Format:
+   - Return a JSON array of strings
+   - Use square brackets and double quotes
+   - Questions must be unique (no duplicates)
+   - If context is sufficient, return empty array []
+   - Maximum 3 follow-up questions
+   - Minimum length per question: 30 characters
+   - No null values or empty strings
+
+Example:
+Original: "How did the development of antibiotics affect military casualties in WWII?"
+
+Invalid responses:
+{'questions': ['What are antibiotics?']}  // Wrong format
+['What is WWII?']  // Too basic
+['How did it impact things?']  // Too vague
+['', 'Question 2']  // Contains empty string
+['Same question?', 'Same question?']  // Duplicate
+
+Valid response:
+["What were military casualty rates from infections before widespread antibiotic use in 1942?",
+ "How did penicillin availability change throughout different stages of WWII?",
+ "What were the primary battlefield infections treated with antibiotics during WWII?"]
+
+or [] if context fully answers the original question.
+
+Your task: Based on the analysis of the original question and context,
+output ONLY a JSON array of follow-up questions needed to provide a complete answer.
+If no additional information is needed, output an empty array [].
+
+Follow-up Questions:"""
+
+DEFAULT_QUERY_RETRY_PROMPT_TEMPLATE = '''
+{query}
+
+The {dialect} query above failed with the error message: {error}.
+
+<< TABLES YOU HAVE ACCESS TO >>
+1. {embeddings_table} - Contains document chunks, vector embeddings, and metadata for documents.
+
+Columns:
+```json
+{{
+    "id": {{
+        "type": "string",
+        "description": "Unique ID for this document chunk"
+    }},
+    "content": {{
+        "type": "string",
+        "description": "A document chunk (subset of the original document)"
+    }},
+    "embeddings": {{
+        "type": "vector",
+        "description": "Vector embeddings for the document chunk."
+    }},
+    "metadata": {{
+        "type": "jsonb",
+        "description": "Metadata for the document chunk."
+    }}
+}}
+
+{schema}
+
+Rewrite the query so it works.
+
+Output the final SQL query only.
+
+SQL Query:
+'''
+
+DEFAULT_NUM_QUERY_RETRIES = 2
 
 
 class LLMConfig(BaseModel):
     model_name: str = Field(default=DEFAULT_LLM_MODEL, description='LLM model to use for generation')
     provider: str = Field(default=DEFAULT_LLM_MODEL_PROVIDER, description='LLM model provider to use for generation')
-    params: Dict[str, Any] = {}
+    params: Dict[str, Any] = Field(default_factory=dict)
 
 
 class MultiVectorRetrieverMode(Enum):
@@ -109,16 +307,21 @@ class VectorStoreConfig(BaseModel):
     collection_name: str = DEFAULT_COLLECTION_NAME
     connection_string: str = None
     kb_table: Any = None
+    is_sparse: bool = False
+    vector_size: Optional[int] = None
 
     class Config:
         arbitrary_types_allowed = True
         extra = "forbid"
 
 
-class RetrieverType(Enum):
-    VECTOR_STORE = 'vector_store'
-    AUTO = 'auto'
-    MULTI = 'multi'
+class RetrieverType(str, Enum):
+    """Retriever type for RAG pipeline"""
+    VECTOR_STORE = "vector_store"
+    AUTO = "auto"
+    MULTI = "multi"
+    SQL = "sql"
+    MULTI_HOP = "multi_hop"
 
 
 class SearchType(Enum):
@@ -166,6 +369,80 @@ class SearchKwargs(BaseModel):
         return super().model_dump(*args, **kwargs)
 
 
+class ColumnSchema(BaseModel):
+    name: str = Field(
+        description="Name of the column in the database"
+    )
+    type: str = Field(
+        description="Type of the column (e.g. int, string, datetime)"
+    )
+    description: str = Field(
+        description="Description of what the column represents"
+    )
+    values: Optional[Dict[Any, Any]] = Field(
+        default=None,
+        description="Mapping of values the column can be with the description of what the value means"
+    )
+
+
+class MetadataSchema(BaseModel):
+    table: str = Field(
+        description="Name of table in the database"
+    )
+    description: str = Field(
+        description="Description of what the table represents"
+    )
+    columns: List[ColumnSchema] = Field(
+        description="List of column schemas describing the metadata columns available for the table"
+    )
+    join: str = Field(
+        description="SQL join string to join this table with source documents table",
+        default=''
+    )
+
+    class Config:
+        frozen = True
+
+
+class LLMExample(BaseModel):
+    input: str = Field(
+        description="User input for the example"
+    )
+    output: str = Field(
+        description="What the LLM should generate for this example's input"
+    )
+
+
+class SQLRetrieverConfig(BaseModel):
+    llm_config: LLMConfig = Field(
+        default_factory=LLMConfig,
+        description="LLM configuration to use for generating the final SQL query for retrieval"
+    )
+    metadata_filters_prompt_template: str = Field(
+        default=DEFAULT_METADATA_FILTERS_PROMPT_TEMPLATE,
+        description="Prompt template to generate PostgreSQL metadata filters. Has 'format_instructions', 'schema', 'examples', and 'input' input variables"
+    )
+    num_retries: int = Field(
+        default=DEFAULT_NUM_QUERY_RETRIES,
+        description="How many times for an LLM to try rewriting a failed SQL query before using the fallback retriever."
+    )
+    rewrite_prompt_template: str = Field(
+        default=DEFAULT_SEMANTIC_PROMPT_TEMPLATE,
+        description="Prompt template to rewrite user input to be better suited for retrieval. Has 'input' input variable."
+    )
+    source_table: str = Field(
+        description="Name of the source table containing the original documents that were embedded"
+    )
+    metadata_schemas: Optional[List[MetadataSchema]] = Field(
+        default=None,
+        description="Optional list of table schemas containing document metadata to potentially join with."
+    )
+    examples: Optional[List[LLMExample]] = Field(
+        default=None,
+        description="Optional examples of final generated pgvector queries based on user input."
+    )
+
+
 class SummarizationConfig(BaseModel):
     llm_config: LLMConfig = Field(
         default_factory=LLMConfig,
@@ -188,8 +465,34 @@ class SummarizationConfig(BaseModel):
 class RerankerConfig(BaseModel):
     model: str = DEFAULT_RERANKING_MODEL
     base_url: str = DEFAULT_LLM_ENDPOINT
-    filtering_threshold: float = 0.99
+    filtering_threshold: float = 0.5
     num_docs_to_keep: Optional[int] = None
+    max_concurrent_requests: int = 20
+    max_retries: int = 3
+    retry_delay: float = 1.0
+    early_stop: bool = True  # Whether to enable early stopping
+    early_stop_threshold: float = 0.8  # Confidence threshold for early stopping
+
+
+class MultiHopRetrieverConfig(BaseModel):
+    """Configuration for multi-hop retrieval"""
+    base_retriever_type: RetrieverType = Field(
+        default=RetrieverType.VECTOR_STORE,
+        description="Type of base retriever to use for multi-hop retrieval"
+    )
+    max_hops: int = Field(
+        default=3,
+        description="Maximum number of follow-up questions to generate",
+        ge=1
+    )
+    reformulation_template: str = Field(
+        default=DEFAULT_QUESTION_REFORMULATION_TEMPLATE,
+        description="Template for reformulating questions"
+    )
+    llm_config: LLMConfig = Field(
+        default_factory=LLMConfig,
+        description="LLM configuration to use for generating follow-up questions"
+    )
 
 
 class RAGPipelineModel(BaseModel):
@@ -256,6 +559,11 @@ class RAGPipelineModel(BaseModel):
         default=None,
         description="Configuration for summarizing retrieved documents as context"
     )
+    # SQL retriever specific.
+    sql_retriever_config: Optional[SQLRetrieverConfig] = Field(
+        default=None,
+        description="Configuration for retrieving documents by generating SQL to filter by metadata & order by distance function"
+    )
 
     # Multi retriever specific
     multi_retriever_mode: MultiVectorRetrieverMode = Field(
@@ -312,6 +620,20 @@ class RAGPipelineModel(BaseModel):
         default_factory=RerankerConfig,
         description="Reranker configuration"
     )
+
+    multi_hop_config: Optional[MultiHopRetrieverConfig] = Field(
+        default=None,
+        description="Configuration for multi-hop retrieval. Required when retriever_type is MULTI_HOP."
+    )
+
+    @field_validator("multi_hop_config")
+    @classmethod
+    def validate_multi_hop_config(cls, v: Optional[MultiHopRetrieverConfig], info):
+        """Validate that multi_hop_config is set when using multi-hop retrieval."""
+        values = info.data
+        if values.get("retriever_type") == RetrieverType.MULTI_HOP and v is None:
+            raise ValueError("multi_hop_config must be set when using multi-hop retrieval")
+        return v
 
     class Config:
         arbitrary_types_allowed = True

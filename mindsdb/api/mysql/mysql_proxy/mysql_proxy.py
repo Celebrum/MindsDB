@@ -83,6 +83,7 @@ from mindsdb.api.mysql.mysql_proxy.utilities.lightwood_dtype import dtype
 from mindsdb.utilities import log
 from mindsdb.utilities.config import Config
 from mindsdb.utilities.context import context as ctx
+from mindsdb.utilities.otel.metric_handlers import get_query_request_counter
 from mindsdb.utilities.wizards import make_ssl_cert
 
 logger = log.getLogger(__name__)
@@ -343,7 +344,7 @@ class MysqlProxy(SocketServer.BaseRequestHandler):
             data = []
         packets = []
         for i, column in enumerate(columns):
-            logger.info(
+            logger.debug(
                 "%s._get_column_defenition_packets: handling column - %s of %s type",
                 self.__class__.__name__,
                 column,
@@ -562,6 +563,12 @@ class MysqlProxy(SocketServer.BaseRequestHandler):
                 data=executor.data,
                 status=executor.server_status,
             )
+
+        # Increment the counter and include metadata in attributes
+        metadata = ctx.metadata(query=sql)
+        query_request_counter = get_query_request_counter()
+        query_request_counter.add(1, metadata)
+
         return resp
 
     def answer_stmt_prepare(self, sql):
@@ -737,7 +744,7 @@ class MysqlProxy(SocketServer.BaseRequestHandler):
                 if p.type.value == COMMANDS.COM_QUERY:
                     sql = self.decode_utf(p.sql.value)
                     sql = SqlStatementParser.clear_sql(sql)
-                    logger.debug(f"COM_QUERY: {sql}")
+                    logger.debug(f'Incoming query: {sql}')
                     profiler.set_meta(
                         query=sql, api="mysql", environment=Config().get("environment")
                     )

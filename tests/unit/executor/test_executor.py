@@ -548,6 +548,20 @@ class Test(BaseExecutorMockPredictor):
         assert ret_df.shape[0] == 3
         assert ret_df.t.min() == 2024.
 
+        # > latest with CTE
+        ret = self.execute("""
+            WITH trainingdata AS (
+                select a.t, a.* from files.tasks a
+            )
+            select t.t as t0, p.* from trainingdata t
+            join mindsdb.task_model p
+            where t.t > latest and t.g = 'x'
+        """)
+
+        ret_df = self.ret_to_df(ret)
+        assert ret_df.shape[0] == 3
+        assert ret_df.t.min() == 2024.
+
     @patch('mindsdb.integrations.handlers.postgres_handler.Handler')
     def test_drop_database(self, mock_handler):
         from mindsdb.utilities.exception import EntityNotExistsError
@@ -1030,7 +1044,7 @@ class TestWithNativeQuery(BaseExecutorMockPredictor):
         # input = one row whit a==2
         data_in = self.mock_predict.call_args[0][1]
         assert len(data_in) == 1
-        assert data_in.iloc[0]['a'] == 2
+        assert data_in._predict_df.iloc[0]['a'] == 2
 
         # check prediction
         assert ret.data.to_lists()[0][0] == predicted_value
@@ -1090,7 +1104,7 @@ class TestWithNativeQuery(BaseExecutorMockPredictor):
         assert mock_handler().native_query.call_args[0][0] == 'select * from tasks'
 
         # input to predictor all 9 rows
-        when_data = self.mock_predict.call_args[0][1]
+        when_data = self.mock_predict.call_args[0][1]._predict_df
         assert len(when_data) == 9
 
         # all group values in input

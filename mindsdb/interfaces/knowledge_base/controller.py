@@ -25,8 +25,12 @@ from mindsdb.integrations.libs.vectordatabase_handler import (
     VectorStoreHandler,
 )
 from mindsdb.integrations.utilities.rag.rag_pipeline_builder import RAG
-from mindsdb.integrations.utilities.rag.settings import RAGPipelineModel
-from mindsdb.interfaces.agents.langchain_agent import build_embedding_model, create_chat_model, get_llm_provider
+from mindsdb.integrations.utilities.rag.config_loader import load_rag_config
+from mindsdb.integrations.utilities.sql_utils import (
+    extract_comparison_conditions, filter_dataframe, FilterCondition, FilterOperator
+)
+from mindsdb.interfaces.agents.constants import DEFAULT_EMBEDDINGS_MODEL_CLASS
+from mindsdb.interfaces.agents.langchain_agent import create_chat_model, get_llm_provider
 from mindsdb.interfaces.database.projects import ProjectController
 from mindsdb.interfaces.knowledge_base.preprocessing.models import PreprocessingConfig, Document
 from mindsdb.interfaces.knowledge_base.preprocessing.document_preprocessor import PreprocessorFactory
@@ -51,16 +55,20 @@ class KnowledgeBaseTable:
         self.session = session
         self.document_preprocessor = None
         self.document_loader = None
+        self.model_params = None
 
     def configure_preprocessing(self, config: Optional[dict] = None):
         """Configure preprocessing for the knowledge base table"""
+        logger.debug(f"Configuring preprocessing with config: {config}")
         self.document_preprocessor = None  # Reset existing preprocessor
         if config is not None:
             preprocessing_config = PreprocessingConfig(**config)
             self.document_preprocessor = PreprocessorFactory.create_preprocessor(preprocessing_config)
+            logger.debug(f"Created preprocessor of type: {type(self.document_preprocessor)}")
         else:
             # Always create a default preprocessor if none specified
             self.document_preprocessor = PreprocessorFactory.create_preprocessor()
+            logger.debug("Created default preprocessor")
 
     def select_query(self, query: Select) -> pd.DataFrame:
         """
@@ -69,13 +77,15 @@ class KnowledgeBaseTable:
         :param query: query to KB table
         :return: dataframe with the result table
         """
+        logger.debug(f"Processing select query: {query}")
 
         # replace content with embeddings
-
         query_traversal(query.where, self._replace_query_content)
+        logger.debug("Replaced content with embeddings in where clause")
 
         # set table name
         query.from_table = Identifier(parts=[self._kb.vector_database_table])
+        logger.debug(f"Set table name to: {self._kb.vector_database_table}")
 
         # remove embeddings from result
         targets = []
@@ -89,11 +99,35 @@ class KnowledgeBaseTable:
             elif isinstance(target, Identifier) and target.parts[-1].lower() != TableField.EMBEDDINGS.value:
                 targets.append(target)
         query.targets = targets
+        logger.debug(f"Modified query targets: {targets}")
 
-        # send to vectordb
+        # Get response from vector db
         db_handler = self.get_vector_db()
-        resp = db_handler.query(query)
-        return resp.data_frame
+        logger.debug(f"Using vector db handler: {type(db_handler)}")
+
+        vector_filters, outer_filters = [], []
+        # update vector handlers, mark conditions as applied inside
+        for op, arg1, arg2 in extract_comparison_conditions(query.where):
+            condition = FilterCondition(arg1, FilterOperator(op.upper()), arg2)
+            if arg1 in (TableField.ID.value, TableField.CONTENT.value, TableField.EMBEDDINGS.value):
+                vector_filters.append(condition)
+            else:
+                outer_filters.append([op, arg1, arg2])
+
+        df = db_handler.dispatch_select(query, conditions=vector_filters)
+
+        if df is not None:
+            df = filter_dataframe(df, outer_filters)
+
+            logger.debug(f"Query returned {len(df)} rows")
+            logger.debug(f"Columns in response: {df.columns.tolist()}")
+            # Log a sample of IDs to help diagnose issues
+            if not df.empty:
+                logger.debug(f"Sample of IDs in response: {df['id'].head().tolist()}")
+        else:
+            logger.warning("Query returned no data")
+
+        return df
 
     def insert_files(self, file_names: List[str]):
         """Process and insert files"""
@@ -470,6 +504,7 @@ class KnowledgeBaseTable:
         df_out = project_datanode.predict(
             model_name=model_rec.name,
             df=df,
+            params=self.model_params
         )
 
         target = model_rec.to_predict[0]
@@ -494,45 +529,56 @@ class KnowledgeBaseTable:
         """
         Builds a RAG pipeline with returned sources
 
-        :param retrieval_config: dict with retrieval config
+        Args:
+            retrieval_config: dict with retrieval config
+
+        Returns:
+            RAG: Configured RAG pipeline instance
+
+        Raises:
+            ValueError: If the configuration is invalid or required components are missing
         """
-        # validate that the retrieval_config has the correct parameters
-        rag_pipeline_model = RAGPipelineModel(**retrieval_config)
-
-        # get embedding model on the kb
-        embeddings_model_id = self._kb.embedding_model_id
-        model_rec = db.session.query(db.Predictor).filter_by(id=embeddings_model_id).first()
-
-        if model_rec is None:
-            raise ValueError(f"Model not found: {embeddings_model_id}")
-
-        # get using args used to create embedding model
-        model_using = model_rec.learn_args.get('using', {})
-        embedding_model_args = {"embedding_model_args": model_using}
-
-        # build and set the embedding model in the retrieval_config
-        embeddings_model = build_embedding_model(embedding_model_args)
-        rag_pipeline_model.embedding_model = embeddings_model
-
-        # build and set the llm in the retrieval_config
-        llm_args = {"model_name": rag_pipeline_model.llm_model_name}
-
-        if not rag_pipeline_model.llm_provider:
-            # If llm provider not set by user, we get it from model name
-            llm_args['provider'] = get_llm_provider(llm_args)
+        # Get embedding model from knowledge base
+        embeddings_model = None
+        if self._kb.embedding_model:
+            # Extract embedding model args from knowledge base table
+            embedding_args = self._kb.embedding_model.learn_args.get('using', {})
+            # Construct the embedding model directly
+            from mindsdb.integrations.handlers.langchain_embedding_handler.langchain_embedding_handler import construct_model_from_args
+            embeddings_model = construct_model_from_args(embedding_args)
+            logger.debug(f"Using knowledge base embedding model with args: {embedding_args}")
         else:
-            # If llm provider is set by user, we use it
-            llm_args["provider"] = rag_pipeline_model.llm_provider
+            embeddings_model = DEFAULT_EMBEDDINGS_MODEL_CLASS()
+            logger.debug("Using default embedding model as knowledge base has no embedding model")
 
-        rag_pipeline_model.llm = create_chat_model(llm_args)
+        # Update retrieval config with knowledge base parameters
+        kb_params = {
+            'vector_store_config': {
+                'kb_table': self
+            }
+        }
 
-        # set the kb table name in the retrieval_config
-        rag_pipeline_model.vector_store_config.kb_table = self
+        # Load and validate config
+        try:
+            rag_config = load_rag_config(retrieval_config, kb_params, embeddings_model)
 
-        # Build RAG pipeline model
-        rag = RAG(rag_pipeline_model)
+            # Build LLM if specified
+            if 'llm_model_name' in rag_config:
+                llm_args = {"model_name": rag_config.llm_model_name}
+                if not rag_config.llm_provider:
+                    llm_args['provider'] = get_llm_provider(llm_args)
+                else:
+                    llm_args["provider"] = rag_config.llm_provider
+                rag_config.llm = create_chat_model(llm_args)
 
-        return rag
+            # Create RAG pipeline
+            rag = RAG(rag_config)
+            logger.debug(f"RAG pipeline created with config: {rag_config}")
+            return rag
+
+        except Exception as e:
+            logger.error(f"Error building RAG pipeline: {str(e)}")
+            raise ValueError(f"Failed to build RAG pipeline: {str(e)}")
 
     def _parse_metadata(self, base_metadata):
         """Helper function to robustly parse metadata string to dict"""
@@ -613,17 +659,25 @@ class KnowledgeBaseController:
             storage: Identifier,
             params: dict,
             preprocessing_config: Optional[dict] = None,
-            if_not_exists: bool = False,
+            if_not_exists: bool = False
     ) -> db.KnowledgeBase:
         """
         Add a new knowledge base to the database
         :param preprocessing_config: Optional preprocessing configuration to validate and store
+        :param is_sparse: Whether to use sparse vectors for embeddings
+        :param vector_size: Optional size specification for vectors, required when is_sparse=True
         """
         # Validate preprocessing config first if provided
         if preprocessing_config is not None:
             PreprocessingConfig(**preprocessing_config)  # Validate before storing
             params = params or {}
             params['preprocessing'] = preprocessing_config
+
+        # Check if vector_size is provided when using sparse vectors
+        is_sparse = params.get('is_sparse')
+        vector_size = params.get('vector_size')
+        if is_sparse and vector_size is None:
+            raise ValueError("vector_size is required when is_sparse=True")
 
         # get project id
         project = self.session.database_controller.get_project(project_name)
@@ -641,6 +695,7 @@ class KnowledgeBaseController:
         if embedding_model is None:
             # create default embedding model
             model_name = self._get_default_embedding_model(project.name, params=params)
+            params['default_embedding_model'] = model_name
         else:
             # get embedding model from input
             model_name = embedding_model.parts[-1]
@@ -663,24 +718,41 @@ class KnowledgeBaseController:
             cloud_pg_vector = os.environ.get('KB_PGVECTOR_URL')
             if cloud_pg_vector:
                 vector_table_name = name
-                vector_db_name = self._create_persistent_pgvector()
+                # Add sparse vector support for pgvector
+                vector_db_params = {}
+                # Check both explicit parameter and model configuration
+                is_sparse = is_sparse or model_record.learn_args.get('using', {}).get('sparse')
+                if is_sparse:
+                    vector_db_params['is_sparse'] = True
+                    if vector_size is not None:
+                        vector_db_params['vector_size'] = vector_size
+                vector_db_name = self._create_persistent_pgvector(vector_db_params)
+
             else:
                 # create chroma db with same name
                 vector_table_name = "default_collection"
                 vector_db_name = self._create_persistent_chroma(name)
                 # memorize to remove it later
-                params['vector_storage'] = vector_db_name
+                params['default_vector_storage'] = vector_db_name
         elif len(storage.parts) != 2:
             raise ValueError('Storage param has to be vector db with table')
         else:
             vector_db_name, vector_table_name = storage.parts
 
-        vector_database_id = self.session.integration_controller.get(vector_db_name)['id']
-
-        # create table in vectordb
+        # create table in vectordb before creating KB
         self.session.datahub.get(vector_db_name).integration_handler.create_table(
             vector_table_name
         )
+        vector_database_id = self.session.integration_controller.get(vector_db_name)['id']
+
+        # Store sparse vector settings in params if specified
+        if is_sparse:
+            params = params or {}
+            params['vector_config'] = {
+                'is_sparse': is_sparse
+            }
+            if vector_size is not None:
+                params['vector_config']['vector_size'] = vector_size
 
         kb = db.KnowledgeBase(
             name=name,
@@ -694,16 +766,15 @@ class KnowledgeBaseController:
         db.session.commit()
         return kb
 
-    def _create_persistent_pgvector(self):
+    def _create_persistent_pgvector(self, params=None):
         """Create default vector database for knowledge base, if not specified"""
-
         vector_store_name = "kb_pgvector_store"
 
         # check if exists
         if self.session.integration_controller.get(vector_store_name):
             return vector_store_name
 
-        self.session.integration_controller.add(vector_store_name, 'pgvector', {})
+        self.session.integration_controller.add(vector_store_name, 'pgvector', params or {})
         return vector_store_name
 
     def _create_persistent_chroma(self, kb_name, engine="chromadb"):
@@ -774,27 +845,19 @@ class KnowledgeBaseController:
             else:
                 raise EntityNotExistsError("Knowledge base does not exist", name)
 
-        # drop table
-        vector_db = db.Integration.query.get(kb.vector_database_id)
-        if vector_db:
-            database_name = vector_db.name
-            self.session.datahub.get(database_name).integration_handler.drop_table(
-                kb.vector_database_table
-            )
-
         # kb exists
         db.session.delete(kb)
         db.session.commit()
 
         # drop objects if they were created automatically
-        if 'vector_storage' in kb.params:
+        if 'default_vector_storage' in kb.params:
             try:
-                self.session.integration_controller.delete(kb.params['vector_storage'])
+                self.session.integration_controller.delete(kb.params['default_vector_storage'])
             except EntityNotExistsError:
                 pass
-        if 'embedding_model' in kb.params:
+        if 'default_embedding_model' in kb.params:
             try:
-                self.session.model_controller.delete_model(kb.params['embedding_model'], project_name)
+                self.session.model_controller.delete_model(kb.params['default_embedding_model'], project_name)
             except EntityNotExistsError:
                 pass
 
@@ -813,16 +876,19 @@ class KnowledgeBaseController:
         )
         return kb
 
-    def get_table(self, name: str, project_id: int) -> KnowledgeBaseTable:
+    def get_table(self, name: str, project_id: int, params: dict = None) -> KnowledgeBaseTable:
         """
         Returns kb table object with properly configured preprocessing
         :param name: table name
         :param project_id: project id
+        :param params: runtime parameters for KB. Keys: 'model' - parameters for embedding model
         :return: kb table object
         """
         kb = self.get(name, project_id)
         if kb is not None:
             table = KnowledgeBaseTable(kb, self.session)
+            if params:
+                table.model_params = params.get('model')
 
             # Always configure preprocessing - either from params or default
             if kb.params and 'preprocessing' in kb.params:
