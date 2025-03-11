@@ -35,7 +35,7 @@ class LLMDataController:
             llm_data_id (int): The ID of the LLM data to delete.
         '''
         llm_data = self.get_llm_data(llm_data_id)
-        if llm_data is None:
+        if (llm_data is None):
             raise ValueError("LLM Data not found")
 
         db.session.delete(llm_data)
@@ -61,3 +61,47 @@ class LLMDataController:
             LLMData: The LLMData object, or None if not found.
         '''
         return db.session.query(db.LLMData).filter_by(model_id=llm_data_id).first()
+
+    def add_notebook_llm_data(self, 
+                            input_data: str, 
+                            output_data: str, 
+                            model_id: int,
+                            context_data: dict = None) -> db.LLMData:
+        '''
+        Adds notebook-specific LLM data with context information.
+        Parameters:
+            input_data (str): The input query or prompt
+            output_data (str): The generated output
+            model_id (int): The ID of the model/agent
+            context_data (dict): Additional context (files, repo state, etc)
+        Returns:
+            LLMData: The created LLM data object
+        '''
+        llm_data = db.LLMData(
+            input=input_data,
+            output=output_data,
+            model_id=model_id,
+            metadata={
+                "type": "notebook",
+                "context": context_data or {}
+            }
+        )
+        db.session.add(llm_data)
+        db.session.commit()
+        return llm_data
+
+    def get_notebook_context(self, llm_data_id: int) -> dict:
+        '''
+        Retrieves notebook-specific context for an LLM data entry.
+        Parameters:
+            llm_data_id (int): The ID of the LLM data
+        Returns:
+            dict: The context data if available, empty dict otherwise
+        '''
+        llm_data = self.get_llm_data(llm_data_id)
+        if not llm_data:
+            return {}
+        metadata = getattr(llm_data, 'metadata', {})
+        if not isinstance(metadata, dict):
+            return {}
+        return metadata.get('context', {})
