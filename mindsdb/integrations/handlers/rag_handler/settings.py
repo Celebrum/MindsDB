@@ -458,6 +458,8 @@ def build_llm_params(args: dict, update=False) -> Dict:
         llm_config_class = WriterLLMParameters
     elif args["llm_type"] == "openai":
         llm_config_class = OpenAIParameters
+    elif args["llm_type"] == "notebook":
+        llm_config_class = NotebookLLMParameters
     else:
         raise UnsupportedLLM(
             f"'llm_type' must be one of {SUPPORTED_LLMS}, got {args['llm_type']}"
@@ -477,3 +479,42 @@ def build_llm_params(args: dict, update=False) -> Dict:
     args["llm_params"] = llm_config_class(**llm_params)
 
     return args
+
+class NotebookLLMParameters:
+    """Parameters for NotebookLLM specialized configuration"""
+    def __init__(self, 
+                 model_name: str = "SeCuReDmE_notebook",
+                 temperature: float = 0.3,
+                 max_tokens: int = 2048,
+                 top_p: float = 0.9,
+                 top_k: int = 40,
+                 request_timeout: int = 120,
+                 format: str = "markdown",
+                 documentation_mode: bool = True,
+                 architecture_analysis: bool = True,
+                 context_window: int = 8192):
+        self.model_name = model_name
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.top_p = top_p
+        self.top_k = top_k
+        self.request_timeout = request_timeout
+        self.format = format
+        self.documentation_mode = documentation_mode
+        self.architecture_analysis = architecture_analysis
+        self.context_window = context_window
+        
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert parameters to dictionary"""
+        return {
+            "model_name": self.model_name,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "request_timeout": self.request_timeout,
+            "format": self.format,
+            "documentation_mode": self.documentation_mode,
+            "architecture_analysis": self.architecture_analysis,
+            "context_window": self.context_window
+        }
