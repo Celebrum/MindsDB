@@ -9,7 +9,8 @@ import subprocess
 import concurrent.futures
 from typing import Text, Tuple, Dict, List, Optional, Any
 import openai
-from openai import OpenAI, NotFoundError, AuthenticationError
+from openai.types.fine_tuning import FineTuningJob
+from openai import OpenAI, AzureOpenAI, NotFoundError, AuthenticationError
 import numpy as np
 import pandas as pd
 
@@ -87,7 +88,7 @@ class OpenAIHandler(BaseMLEngine):
         if api_key is not None:
             org = connection_args.get('api_organization')
             api_base = connection_args.get('api_base') or os.environ.get('OPENAI_API_BASE', OPENAI_API_BASE)
-            client = self._get_client(api_key=api_key, base_url=api_base, org=org)
+            client = self._get_client(api_key=api_key, base_url=api_base, org=org, args=connection_args)
             OpenAIHandler._check_client_connection(client)
 
     @staticmethod
@@ -188,7 +189,9 @@ class OpenAIHandler(BaseMLEngine):
                 "temperature",
                 "openai_api_key",
                 "api_organization",
-                "api_base"
+                "api_base",
+                "api_version",
+                "provider",
             }
         )
 
@@ -204,7 +207,7 @@ class OpenAIHandler(BaseMLEngine):
         api_key = get_api_key('openai', args, engine_storage=engine_storage)
         api_base = args.get('api_base') or connection_args.get('api_base') or os.environ.get('OPENAI_API_BASE', OPENAI_API_BASE)
         org = args.get('api_organization')
-        client = OpenAIHandler._get_client(api_key=api_key, base_url=api_base, org=org)
+        client = OpenAIHandler._get_client(api_key=api_key, base_url=api_base, org=org, args=args)
         OpenAIHandler._check_client_connection(client)
 
     def create(self, target, args: Dict = None, **kwargs: Any) -> None:
@@ -228,7 +231,8 @@ class OpenAIHandler(BaseMLEngine):
             api_key = get_api_key(self.api_key_name, args, self.engine_storage)
             connection_args = self.engine_storage.get_connection_args()
             api_base = args.get('api_base') or connection_args.get('api_base') or os.environ.get('OPENAI_API_BASE') or self.api_base
-            available_models = get_available_models(api_key, api_base)
+            client = self._get_client(api_key=api_key, base_url=api_base, org=args.get('api_organization'), args=args)
+            available_models = get_available_models(client)
 
             if not args.get('mode'):
                 args['mode'] = self.default_mode
@@ -810,6 +814,7 @@ class OpenAIHandler(BaseMLEngine):
             api_key=api_key,
             base_url=args.get('api_base'),
             org=args.pop('api_organization') if 'api_organization' in args else None,
+            args=args
         )
 
         try:
@@ -891,7 +896,8 @@ class OpenAIHandler(BaseMLEngine):
                 client = self._get_client(
                     api_key=api_key,
                     base_url=args.get('api_base'),
-                    org=args.get('api_organization')
+                    org=args.get('api_organization'),
+                    args=args,
                 )
                 meta = client.models.retrieve(model_name)
             except Exception as e:
@@ -935,7 +941,7 @@ class OpenAIHandler(BaseMLEngine):
 
         api_base = using_args.get('api_base', os.environ.get('OPENAI_API_BASE', OPENAI_API_BASE))
         org = using_args.get('api_organization')
-        client = self._get_client(api_key=api_key, base_url=api_base, org=org)
+        client = self._get_client(api_key=api_key, base_url=api_base, org=org, args=args)
 
         args = {**using_args, **args}
         prev_model_name = self.base_model_storage.json_get('args').get('model_name', '')
@@ -1111,7 +1117,7 @@ class OpenAIHandler(BaseMLEngine):
         }
         return {**ft_params, **extra_params}
 
-    def _ft_call(self, ft_params: Dict, client: OpenAI, hour_budget: int) -> Tuple[openai.types.fine_tuning.FineTuningJob, Text]:
+    def _ft_call(self, ft_params: Dict, client: OpenAI, hour_budget: int) -> Tuple[FineTuningJob, Text]:
         """
         Submit a fine-tuning job via the OpenAI API.
         This method handles requests to both the legacy and new endpoints.
@@ -1129,7 +1135,7 @@ class OpenAIHandler(BaseMLEngine):
             PendingFT: If the fine-tuning process is still pending.
 
         Returns:
-            Tuple[openai.types.fine_tuning.FineTuningJob, Text]: Fine-tuning stats and result file ID.
+            Tuple[FineTuningJob, Text]: Fine-tuning stats and result file ID.
         """
         ft_result = client.fine_tuning.jobs.create(
             **{k: v for k, v in ft_params.items() if v is not None}
@@ -1138,7 +1144,7 @@ class OpenAIHandler(BaseMLEngine):
         @retry_with_exponential_backoff(
             hour_budget=hour_budget,
         )
-        def _check_ft_status(job_id: Text) -> openai.types.fine_tuning.FineTuningJob:
+        def _check_ft_status(job_id: Text) -> FineTuningJob:
             """
             Check the status of a fine-tuning job via the OpenAI API.
 
@@ -1149,7 +1155,7 @@ class OpenAIHandler(BaseMLEngine):
                 PendingFT: If the fine-tuning process is still pending.
 
             Returns:
-                openai.types.fine_tuning.FineTuningJob: Fine-tuning stats.
+                FineTuningJob: Fine-tuning stats.
             """
             ft_retrieved = client.fine_tuning.jobs.retrieve(fine_tuning_job_id=job_id)
             if ft_retrieved.status in ('succeeded', 'failed', 'cancelled'):
@@ -1173,7 +1179,7 @@ class OpenAIHandler(BaseMLEngine):
         return ft_stats, result_file_id
 
     @staticmethod
-    def _get_client(api_key: Text, base_url: Text, org: Optional[Text] = None) -> OpenAI:
+    def _get_client(api_key: Text, base_url: Text, org: Optional[Text] = None, args: dict = None) -> OpenAI:
         """
         Get an OpenAI client with the given API key, base URL, and organization.
 
@@ -1185,4 +1191,11 @@ class OpenAIHandler(BaseMLEngine):
         Returns:
             openai.OpenAI: OpenAI client.
         """
+        if args is not None and args.get('provider') == 'azure':
+            return AzureOpenAI(
+                api_key=api_key,
+                azure_endpoint=base_url,
+                api_version=args.get('api_version'),
+                organization=org
+            )
         return OpenAI(api_key=api_key, base_url=base_url, organization=org)

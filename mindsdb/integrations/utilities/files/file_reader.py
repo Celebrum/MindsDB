@@ -1,14 +1,15 @@
+from dataclasses import dataclass, astuple
 import traceback
 import json
 import csv
-from io import BytesIO, StringIO
+from io import BytesIO, StringIO, IOBase
 from pathlib import Path
 import codecs
+from typing import List, Generator
 
 import filetype
 import pandas as pd
 from charset_normalizer import from_bytes
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from mindsdb.utilities import log
 
@@ -18,11 +19,31 @@ DEFAULT_CHUNK_SIZE = 500
 DEFAULT_CHUNK_OVERLAP = 250
 
 
-class FileDetectError(Exception):
-    ...
+class FileProcessingError(Exception): ...
 
 
-def decode(file_obj: BytesIO) -> StringIO:
+@dataclass(frozen=True, slots=True)
+class _SINGLE_PAGE_FORMAT:
+    CSV: str = "csv"
+    JSON: str = "json"
+    TXT: str = "txt"
+    PDF: str = "pdf"
+    PARQUET: str = "parquet"
+
+
+SINGLE_PAGE_FORMAT = _SINGLE_PAGE_FORMAT()
+
+
+@dataclass(frozen=True, slots=True)
+class _MULTI_PAGE_FORMAT:
+    XLSX: str = "xlsx"
+
+
+MULTI_PAGE_FORMAT = _MULTI_PAGE_FORMAT()
+
+
+def decode(file_obj: IOBase) -> StringIO:
+    file_obj.seek(0)
     byte_str = file_obj.read()
     # Move it to StringIO
     try:
@@ -55,55 +76,104 @@ def decode(file_obj: BytesIO) -> StringIO:
                 data_str = StringIO(byte_str.decode(encoding, errors))
     except Exception as e:
         logger.error(traceback.format_exc())
-        raise FileDetectError("Could not load into string") from e
+        raise FileProcessingError("Could not load into string") from e
 
     return data_str
 
 
 class FormatDetector:
+    supported_formats = astuple(SINGLE_PAGE_FORMAT) + astuple(MULTI_PAGE_FORMAT)
+    multipage_formats = astuple(MULTI_PAGE_FORMAT)
 
-    def get(self, name, file_obj: BytesIO = None):
-        format = self.get_format_by_name(name)
-        if format is None and file_obj is not None:
-            format = self.get_format_by_content(file_obj)
+    def __init__(
+        self,
+        path: str | None = None,
+        name: str | None = None,
+        file: IOBase | None = None,
+    ):
+        """
+        File format detector
+        One of these arguments has to be passed: `path` or `file`
 
+        :param path: path to the file
+        :param name: name of the file
+        :param file: file descriptor (via open(...), of BytesIO(...))
+        """
+        if path is not None:
+            file = open(path, "rb")
+
+        elif file is not None:
+            if name is None:
+                if hasattr(file, "name"):
+                    path = file.name
+                else:
+                    path = "file"
+        else:
+            raise FileProcessingError("Wrong arguments: path or file is required")
+
+        if name is None:
+            name = Path(path).name
+
+        self.name = name
+        self.file_obj = file
+        self.format = None
+
+        self.parameters = {}
+
+    def get_format(self) -> str:
+        if self.format is not None:
+            return self.format
+
+        format = self.get_format_by_name()
         if format is not None:
-            return format
-        raise FileDetectError(f'Unable to detect format: {name}')
+            if format not in self.supported_formats:
+                raise FileProcessingError(f"Not supported format: {format}")
 
-    def get_format_by_name(self, filename):
-        extension = Path(filename).suffix.strip(".").lower()
+        if format is None and self.file_obj is not None:
+            format = self.get_format_by_content()
+            self.file_obj.seek(0)
+
+        if format is None:
+            raise FileProcessingError(f"Unable to detect format: {self.name}")
+
+        self.format = format
+        return format
+
+    def get_format_by_name(self):
+        extension = Path(self.name).suffix.strip(".").lower()
         if extension == "tsv":
             extension = "csv"
+            self.parameters["delimiter"] = "\t"
+
         return extension or None
 
-    def get_format_by_content(self, file_obj):
-        if self.is_parquet(file_obj):
-            return "parquet"
+    def get_format_by_content(self):
+        if self.is_parquet(self.file_obj):
+            return SINGLE_PAGE_FORMAT.PARQUET
 
-        file_type = filetype.guess(file_obj)
-        if file_type is None:
-            return
+        file_type = filetype.guess(self.file_obj)
+        if file_type is not None:
+            if file_type.mime in {
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "application/vnd.ms-excel",
+            }:
+                return MULTI_PAGE_FORMAT.XLSX
 
-        if file_type.mime in {
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "application/vnd.ms-excel",
-        }:
-            return 'xlsx'
+            if file_type.mime == "application/pdf":
+                return SINGLE_PAGE_FORMAT.PDF
 
-        if file_type.mime == 'application/pdf':
-            return "pdf"
-
-        file_obj = decode(file_obj)
+        file_obj = decode(self.file_obj)
 
         if self.is_json(file_obj):
-            return "json"
+            return SINGLE_PAGE_FORMAT.JSON
 
         if self.is_csv(file_obj):
-            return "csv"
+            return SINGLE_PAGE_FORMAT.CSV
 
-    def is_json(self, data_obj: StringIO) -> bool:
+    @staticmethod
+    def is_json(data_obj: StringIO) -> bool:
         # see if its JSON
+        data_obj.seek(0)
         text = data_obj.read(100).strip()
         data_obj.seek(0)
         if len(text) > 0:
@@ -114,20 +184,25 @@ class FormatDetector:
                     return True
                 except Exception:
                     return False
-                finally:
-                    data_obj.seek(0)
         return False
 
-    def is_csv(self, data_obj: StringIO) -> bool:
-        sample = data_obj.readline()  # trying to get dialect from header
+    @classmethod
+    def is_csv(cls, data_obj: StringIO) -> bool:
         data_obj.seek(0)
+        sample = data_obj.readline()  # trying to get dialect from header
         try:
+            data_obj.seek(0)
             csv.Sniffer().sniff(sample)
 
+            # Avoid a false-positive for json files
+            if cls.is_json(data_obj):
+                return False
+            return True
         except Exception:
             return False
 
-    def is_parquet(self, data: BytesIO) -> bool:
+    @staticmethod
+    def is_parquet(data: IOBase) -> bool:
         # Check first and last 4 bytes equal to PAR1.
         # Refer: https://parquet.apache.org/docs/file-format/
         parquet_sig = b"PAR1"
@@ -141,71 +216,125 @@ class FormatDetector:
         return False
 
 
-class FileReader:
+def format_column_names(df: pd.DataFrame):
+    df.columns = [column.strip(" \t") for column in df.columns]
+    if len(df.columns) != len(set(df.columns)) or any(len(column_name) == 0 for column_name in df.columns):
+        raise FileProcessingError("Each column should have a unique and non-empty name.")
 
-    def _get_csv_dialect(self, buffer) -> csv.Dialect:
+
+class FileReader(FormatDetector):
+    def _get_fnc(self):
+        format = self.get_format()
+        func = getattr(self, f"read_{format}", None)
+        if func is None:
+            raise FileProcessingError(f"Unsupported format: {format}")
+
+        if format in astuple(MULTI_PAGE_FORMAT):
+
+            def format_multipage(*args, **kwargs):
+                for page_number, df in func(*args, **kwargs):
+                    format_column_names(df)
+                    yield page_number, df
+
+            return format_multipage
+
+        def format_singlepage(*args, **kwargs) -> pd.DataFrame:
+            """Check that the columns have unique not-empty names"""
+            df = func(*args, **kwargs)
+            format_column_names(df)
+            return df
+
+        return format_singlepage
+
+    def get_pages(self, **kwargs) -> List[str]:
+        """
+        Get list of tables in file
+        """
+        format = self.get_format()
+        if format not in self.multipage_formats:
+            # only one table
+            return ["main"]
+
+        func = self._get_fnc()
+        self.file_obj.seek(0)
+
+        return [name for name, _ in func(self.file_obj, only_names=True, **kwargs)]
+
+    def get_contents(self, **kwargs) -> dict[str, pd.DataFrame]:
+        """
+        Get all info(pages with content) from file as dict: {tablename, content}
+        """
+        func = self._get_fnc()
+        self.file_obj.seek(0)
+
+        format = self.get_format()
+        if format not in self.multipage_formats:
+            # only one table
+            return {"main": func(self.file_obj, name=self.name, **kwargs)}
+
+        return {name: df for name, df in func(self.file_obj, **kwargs)}
+
+    def get_page_content(self, page_name: str | None = None, **kwargs) -> pd.DataFrame:
+        """
+        Get content of a single table
+        """
+        func = self._get_fnc()
+        self.file_obj.seek(0)
+
+        format = self.get_format()
+        if format not in self.multipage_formats:
+            # only one table
+            return func(self.file_obj, name=self.name, **kwargs)
+
+        for _, df in func(self.file_obj, name=self.name, page_name=page_name, **kwargs):
+            return df
+
+    @staticmethod
+    def _get_csv_dialect(buffer, delimiter: str | None = None) -> csv.Dialect | None:
         sample = buffer.readline()  # trying to get dialect from header
         buffer.seek(0)
         try:
             if isinstance(sample, bytes):
                 sample = sample.decode()
-            accepted_csv_delimiters = [",", "\t", ";"]
+
+            if delimiter is not None:
+                accepted_csv_delimiters = [delimiter]
+            else:
+                accepted_csv_delimiters = [",", "\t", ";"]
             try:
-                dialect = csv.Sniffer().sniff(
-                    sample, delimiters=accepted_csv_delimiters
-                )
-                dialect.doublequote = (
-                    True  # assume that all csvs have " as string escape
-                )
+                dialect = csv.Sniffer().sniff(sample, delimiters=accepted_csv_delimiters)
+                dialect.doublequote = True  # assume that all csvs have " as string escape
             except Exception:
                 dialect = csv.reader(sample).dialect
                 if dialect.delimiter not in accepted_csv_delimiters:
-                    raise Exception(
-                        f"CSV delimeter '{dialect.delimiter}' is not supported"
-                    )
+                    raise FileProcessingError(f"CSV delimeter '{dialect.delimiter}' is not supported")
 
         except csv.Error:
             dialect = None
         return dialect
 
-    def read(self, format, file_obj: BytesIO, **kwargs) -> pd.DataFrame:
-        func = {
-            'parquet': self.read_parquet,
-            'csv': self.read_csv,
-            'xlsx': self.read_excel,
-            'pdf': self.read_pdf,
-            'json': self.read_json,
-            'txt': self.read_txt,
-        }
-
-        if format not in func:
-            raise FileDetectError(f'Unsupported format: {format}')
-        func = func[format]
-
-        return func(file_obj, **kwargs)
-
-    def read_csv(self, file_obj: BytesIO, **kwargs):
+    @classmethod
+    def read_csv(cls, file_obj: BytesIO, delimiter: str | None = None, **kwargs) -> pd.DataFrame:
         file_obj = decode(file_obj)
-        dialect = self._get_csv_dialect(file_obj)
-
+        dialect = cls._get_csv_dialect(file_obj, delimiter=delimiter)
         return pd.read_csv(file_obj, sep=dialect.delimiter, index_col=False)
 
-    def read_txt(self, file_obj: BytesIO, **kwargs):
+    @staticmethod
+    def read_txt(file_obj: BytesIO, name: str | None = None, **kwargs) -> pd.DataFrame:
+        # the lib is heavy, so import it only when needed
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+
         file_obj = decode(file_obj)
 
         try:
             from langchain_core.documents import Document
         except ImportError:
-            raise ImportError(
-                "To import TXT document please install 'langchain-community':\n"
-                "    pip install langchain-community"
+            raise FileProcessingError(
+                "To import TXT document please install 'langchain-community':\n    pip install langchain-community"
             )
         text = file_obj.read()
 
-        file_name = None
-        if hasattr(file_obj, "name"):
-            file_name = file_obj.name
-        metadata = {"source": file_name}
+        metadata = {"source_file": name, "file_format": "txt"}
         documents = [Document(page_content=text, metadata=metadata)]
 
         text_splitter = RecursiveCharacterTextSplitter(
@@ -213,17 +342,15 @@ class FileReader:
         )
 
         docs = text_splitter.split_documents(documents)
-        return pd.DataFrame(
-            [
-                {"content": doc.page_content, "metadata": doc.metadata}
-                for doc in docs
-            ]
-        )
+        return pd.DataFrame([{"content": doc.page_content, "metadata": doc.metadata} for doc in docs])
 
-    def read_pdf(self, file_obj: BytesIO, **kwargs):
+    @staticmethod
+    def read_pdf(file_obj: BytesIO, name: str | None = None, **kwargs) -> pd.DataFrame:
+        # the libs are heavy, so import it only when needed
         import fitz  # pymupdf
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-        with fitz.open(stream=file_obj) as pdf:  # open pdf
+        with fitz.open(stream=file_obj.read()) as pdf:  # open pdf
             text = chr(12).join([page.get_text() for page in pdf])
 
         text_splitter = RecursiveCharacterTextSplitter(
@@ -233,26 +360,39 @@ class FileReader:
         split_text = text_splitter.split_text(text)
 
         return pd.DataFrame(
-            {"content": split_text, "metadata": [{}] * len(split_text)}
+            {
+                "content": split_text,
+                "metadata": [{"file_format": "pdf", "source_file": name}] * len(split_text),
+            }
         )
 
-    def read_json(self, file_obj: BytesIO, **kwargs):
+    @staticmethod
+    def read_json(file_obj: BytesIO, **kwargs) -> pd.DataFrame:
         file_obj = decode(file_obj)
         file_obj.seek(0)
         json_doc = json.loads(file_obj.read())
         return pd.json_normalize(json_doc, max_level=0)
 
-    def read_parquet(self, file_obj: BytesIO, **kwargs):
+    @staticmethod
+    def read_parquet(file_obj: BytesIO, **kwargs) -> pd.DataFrame:
         return pd.read_parquet(file_obj)
 
-    def read_excel(self, file_obj: BytesIO, sheet_name=None, **kwargs) -> pd.DataFrame:
-
-        file_obj.seek(0)
+    @staticmethod
+    def read_xlsx(
+        file_obj: BytesIO,
+        page_name: str | None = None,
+        only_names: bool = False,
+        **kwargs,
+    ) -> Generator[tuple[str, pd.DataFrame | None], None, None]:
         with pd.ExcelFile(file_obj) as xls:
-            if sheet_name is None:
-                # No sheet specified: Return list of sheets
-                sheet_list = xls.sheet_names
-                return pd.DataFrame(sheet_list, columns=["Sheet_Name"])
-            else:
-                # Specific sheet requested: Load that sheet
-                return pd.read_excel(xls, sheet_name=sheet_name)
+            if page_name is not None:
+                # return specific page
+                yield page_name, pd.read_excel(xls, sheet_name=page_name)
+
+            for page_name in xls.sheet_names:
+                if only_names:
+                    # extract only pages names
+                    df = None
+                else:
+                    df = pd.read_excel(xls, sheet_name=page_name)
+                yield page_name, df

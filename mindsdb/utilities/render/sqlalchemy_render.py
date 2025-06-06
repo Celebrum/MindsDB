@@ -27,6 +27,7 @@ types_map = {}
 for type_name in sa_type_names:
     types_map[type_name.upper()] = getattr(sa.types, type_name)
 types_map['BOOL'] = types_map['BOOLEAN']
+types_map['DEC'] = types_map['DECIMAL']
 
 
 class RenderError(Exception):
@@ -43,6 +44,11 @@ class INTERVAL(ColumnElement):
 @compiles(INTERVAL)
 def _compile_interval(element, compiler, **kw):
     items = element.info.split(' ', maxsplit=1)
+    if compiler.dialect.name == 'oracle' and len(items) == 2:
+        # replace to singular names (remove leading S if exists)
+        if items[1].upper().endswith('S'):
+            items[1] = items[1][:-1]
+
     if compiler.dialect.driver in ['snowflake']:
         # quote all
         args = " ".join(map(str, items))
@@ -62,6 +68,10 @@ class AttributedStr(str):
         obj = str.__new__(cls, string)
         obj.is_quoted = is_quoted
         return obj
+
+    def replace(self, *args):
+        obj = super().replace(*args)
+        return AttributedStr(obj, self.is_quoted)
 
 
 def get_is_quoted(identifier: ast.Identifier):
@@ -93,9 +103,6 @@ class SqlalchemyRender:
         if hasattr(dialect, 'preparer'):
             class Preparer(dialect.preparer):
 
-                def __init__(self, *args, **kwargs):
-                    super().__init__(*args, **kwargs)
-
                 def _requires_quotes(self, value: str) -> bool:
                     # check force-quote flag
                     if isinstance(value, AttributedStr):
@@ -116,6 +123,8 @@ class SqlalchemyRender:
         # https://docs.sqlalchemy.org/en/14/faq/sqlexpressions.html#why-are-percent-signs-being-doubled-up-when-stringifying-sql-statements
         self.dialect = dialect(paramstyle="named")
         self.dialect.div_is_floordiv = False
+
+        self.selects_stack = []
 
         if dialect_name == 'mssql':
             # update version to MS_2008_VERSION for supports_multivalues_insert
@@ -142,14 +151,19 @@ class SqlalchemyRender:
                 part = self.dialect.identifier_preparer.quote(i)
 
             parts2.append(part)
-
-        return sa.column('.'.join(parts2), is_literal=True)
+        text = '.'.join(parts2)
+        if identifier.is_outer and self.dialect.name == 'oracle':
+            text += '(+)'
+        return sa.column(text, is_literal=True)
 
     def get_alias(self, alias):
         if alias is None or len(alias.parts) == 0:
             return None
         if len(alias.parts) > 1:
             raise NotImplementedError(f'Multiple alias {alias.parts}')
+
+        if self.selects_stack:
+            self.selects_stack[-1]['aliases'].append(alias)
 
         is_quoted = get_is_quoted(alias)[0]
         return AttributedStr(alias.parts[0], is_quoted)
@@ -204,12 +218,18 @@ class SqlalchemyRender:
                 alias = self.get_alias(t.alias)
                 col = col.label(alias)
         elif isinstance(t, ast.Function):
-            fnc = self.to_function(t)
+            col = self.to_function(t)
             if t.alias:
                 alias = self.get_alias(t.alias)
+                col = col.label(alias)
             else:
                 alias = str(t.op)
-            col = fnc.label(alias)
+                if self.selects_stack:
+                    aliases = self.selects_stack[-1]['aliases']
+                    if alias not in aliases:
+                        aliases.append(alias)
+                        col = col.label(alias)
+
         elif isinstance(t, ast.BinaryOperation):
             ops = {
                 "+": operators.add,
@@ -242,6 +262,8 @@ class SqlalchemyRender:
 
             op = t.op.lower()
             if op in ('in', 'not in'):
+                if t.args[1].parentheses:
+                    arg1 = [arg1]
                 if isinstance(arg1, sa.sql.selectable.ColumnClause):
                     raise NotImplementedError(f'Required list argument for: {op}')
 
@@ -429,9 +451,9 @@ class SqlalchemyRender:
             return typename
 
         typename = typename.upper()
-        if re.match(r'^INT[\d]*$', typename):
+        if re.match(r'^INT[\d]+$', typename):
             typename = 'BIGINT'
-        if re.match(r'^FLOAT[\d]*$', typename):
+        if re.match(r'^FLOAT[\d]+$', typename):
             typename = 'FLOAT'
 
         return types_map[typename]
@@ -480,7 +502,7 @@ class SqlalchemyRender:
 
         return schema, table_name
 
-    def to_table(self, node):
+    def to_table(self, node, is_lateral=False):
         if isinstance(node, ast.Identifier):
             schema, table_name = self.get_table_name(node)
 
@@ -494,7 +516,10 @@ class SqlalchemyRender:
             alias = None
             if node.alias:
                 alias = self.get_alias(node.alias)
-            table = sub_stmt.subquery(alias)
+            if is_lateral:
+                table = sub_stmt.lateral(alias)
+            else:
+                table = sub_stmt.subquery(alias)
 
         else:
             # TODO tests are failing
@@ -507,6 +532,9 @@ class SqlalchemyRender:
             return self.prepare_union(node)
 
         cols = []
+
+        self.selects_stack.append({'aliases': []})
+
         for t in node.targets:
             col = self.to_expression(t)
             cols.append(col)
@@ -523,8 +551,11 @@ class SqlalchemyRender:
 
                 query = query.add_cte(stmt.cte(self.get_alias(alias), nesting=True))
 
-        if node.distinct:
+        if node.distinct is True:
             query = query.distinct()
+        elif isinstance(node.distinct, list):
+            columns = [self.to_expression(c) for c in node.distinct]
+            query = query.distinct(*columns)
 
         if node.from_table is not None:
             from_table = node.from_table
@@ -536,19 +567,26 @@ class SqlalchemyRender:
                 query = query.select_from(table)
 
                 # other tables
+                has_explicit_join = False
                 for item in join_list[1:]:
-                    table = self.to_table(item['table'])
+                    join_type = item['join_type']
+                    table = self.to_table(item['table'], is_lateral=('LATERAL' in join_type))
                     if item['is_implicit']:
                         # add to from clause
-                        query = query.select_from(table)
+                        if has_explicit_join:
+                            # sqlalchemy doesn't support implicit join after explicit
+                            # convert it to explicit
+                            query = query.join(table, sa.text('1=1'))
+                        else:
+                            query = query.select_from(table)
                     else:
+                        has_explicit_join = True
                         if item['condition'] is None:
                             # otherwise, sqlalchemy raises "Don't know how to join to ..."
                             condition = sa.text('1=1')
                         else:
                             condition = self.to_expression(item['condition'])
 
-                        join_type = item['join_type']
                         if 'ASOF' in join_type:
                             raise NotImplementedError(f'Unsupported join type: {join_type}')
                         method = 'join'
@@ -564,7 +602,7 @@ class SqlalchemyRender:
                             condition,
                             full=is_full
                         )
-            elif isinstance(from_table, ast.Union):
+            elif isinstance(from_table, (ast.Union, ast.Intersect, ast.Except)):
                 alias = None
                 if from_table.alias:
                     alias = self.get_alias(from_table.alias)
@@ -630,6 +668,8 @@ class SqlalchemyRender:
                 query = query.with_for_update()
             else:
                 raise NotImplementedError(f'Select mode: {node.mode}')
+
+        self.selects_stack.pop()
 
         return query
 
