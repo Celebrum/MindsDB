@@ -1,65 +1,55 @@
 import json
-from typing import Any, AsyncIterable, Dict, List, Iterator
+from typing import Any, AsyncIterable, Dict, List
 import requests
-import logging
-
+import httpx
+from mindsdb.api.a2a.utils import to_serializable, convert_a2a_message_to_qa_format
 from mindsdb.api.a2a.constants import DEFAULT_STREAM_TIMEOUT
+from mindsdb.utilities import log
+from mindsdb.utilities.config import config
 
-logger = logging.getLogger(__name__)
+logger = log.getLogger(__name__)
 
 
 class MindsDBAgent:
     """An agent that communicates with MindsDB over HTTP following the A2A protocol."""
 
-    # Supported content-types according to A2A spec. We include both the
-    # mime-type form and the simple "text" token so that clients using either
-    # convention succeed.
     SUPPORTED_CONTENT_TYPES = ["text", "text/plain", "application/json"]
 
     def __init__(
         self,
         agent_name="my_agent",
         project_name="mindsdb",
-        host="localhost",
-        port=47334,
+        user_info: Dict[str, Any] = None,
     ):
         self.agent_name = agent_name
         self.project_name = project_name
-        self.host = host
-        self.port = port
-        self.base_url = f"http://{host}:{port}"
+        port = config.get("api", {}).get("http", {}).get("port", 47334)
+        host = config.get("api", {}).get("http", {}).get("host", "127.0.0.1")
+
+        # Use 127.0.0.1 instead of localhost for better compatibility
+        if host in ("0.0.0.0", ""):
+            url = f"http://127.0.0.1:{port}/"
+        else:
+            url = f"http://{host}:{port}/"
+
+        self.base_url = url
         self.agent_url = f"{self.base_url}/api/projects/{project_name}/agents/{agent_name}"
         self.sql_url = f"{self.base_url}/api/sql/query"
+        self.headers = {k: v for k, v in user_info.items() if v is not None} or {}
         logger.info(f"Initialized MindsDB agent connector to {self.base_url}")
 
     def invoke(self, query, session_id) -> Dict[str, Any]:
         """Send a query to the MindsDB agent using SQL API."""
         try:
-            # Escape single quotes in the query for SQL
             escaped_query = query.replace("'", "''")
-
-            # Build the SQL query to the agent
             sql_query = f"SELECT * FROM {self.project_name}.{self.agent_name} WHERE question = '{escaped_query}'"
-
-            # Log request for debugging
-            logger.info(f"Sending SQL query to MindsDB: {sql_query[:100]}...")
-
-            # Send the request to MindsDB SQL API
-            response = requests.post(self.sql_url, json={"query": sql_query})
+            logger.debug(f"Sending SQL query to MindsDB: {sql_query[:100]}...")
+            response = requests.post(self.sql_url, json={"query": sql_query}, headers=self.headers)
             response.raise_for_status()
-
-            # Process the response
             data = response.json()
-
-            # Log the response for debugging
             logger.debug(f"Received response from MindsDB: {json.dumps(data)[:200]}...")
-
             if "data" in data and len(data["data"]) > 0:
-                # The result should be in the first row
                 result_row = data["data"][0]
-
-                # Find the response column (might be 'response', 'answer', 'result', etc.)
-                # Try common column names or just return all content
                 for column in ["response", "result", "answer", "completion", "output"]:
                     if column in result_row:
                         content = result_row[column]
@@ -68,19 +58,9 @@ class MindsDBAgent:
                             "content": content,
                             "parts": [{"type": "text", "text": content}],
                         }
-
-                # If no specific column found, return the whole row as JSON
                 logger.info("No specific result column found, returning full row")
                 content = json.dumps(result_row, indent=2)
-
-                # Return structured data only if it is a dictionary (A2A `data` part
-                # must itself be a JSON object).  In some cases MindsDB may return a
-                # list (for instance a list of rows or records).  If that happens we
-                # downgrade it to plain-text to avoid schema-validation errors on the
-                # A2A side.
-
-                parts: List[dict] = [{"type": "text", "text": content}]
-
+                parts = [{"type": "text", "text": content}]
                 if isinstance(result_row, dict):
                     parts.append(
                         {
@@ -89,7 +69,6 @@ class MindsDBAgent:
                             "metadata": {"subtype": "json"},
                         }
                     )
-
                 return {
                     "content": content,
                     "parts": parts,
@@ -101,207 +80,68 @@ class MindsDBAgent:
                     "content": error_msg,
                     "parts": [{"type": "text", "text": error_msg}],
                 }
-
         except requests.exceptions.RequestException as e:
-            error_msg = f"Error connecting to MindsDB: {str(e)}"
-            logger.error(error_msg)
+            logger.exception("Error connecting to MindsDB:")
             return {
-                "content": error_msg,
+                "content": f"Error connecting to MindsDB: {e}",
                 "parts": [{"type": "text", "text": error_msg}],
             }
-
         except Exception as e:
-            error_msg = f"Error: {str(e)}"
-            logger.error(error_msg)
+            logger.exception("Error: ")
             return {
-                "content": error_msg,
+                "content": f"Error: {e}",
                 "parts": [{"type": "text", "text": error_msg}],
             }
 
-    def streaming_invoke(self, messages: List[dict], timeout: int = DEFAULT_STREAM_TIMEOUT) -> Iterator[Dict[str, Any]]:
-        """Stream responses from the MindsDB agent using the direct API endpoint.
-
-        Args:
-            messages: List of message dictionaries, each containing 'question' and optionally 'answer'.
-                Example: [{'question': 'what is the average rental price for a three bedroom?', 'answer': None}]
-            timeout: Request timeout in seconds (default: 300)
-
-        Returns:
-            Iterator yielding chunks of the streaming response.
-        """
-        try:
-            # Construct the URL for the streaming completions endpoint
-            url = f"{self.base_url}/api/projects/{self.project_name}/agents/{self.agent_name}/completions/stream"
-
-            # Log request for debugging
-            logger.info(f"Sending streaming request to MindsDB agent: {self.agent_name}")
-            logger.debug(f"Request messages: {json.dumps(messages)[:200]}...")
-
-            # Send the request to MindsDB streaming API with timeout
-            stream = requests.post(url, json={"messages": messages}, stream=True, timeout=timeout)
-            stream.raise_for_status()
-
-            # Process the streaming response directly
-            for line in stream.iter_lines():
-                if line:
-                    # Parse each non-empty line
-                    try:
-                        line = line.decode("utf-8")
-                        if line.startswith("data: "):
-                            # Extract the JSON data from the line that starts with 'data: '
-                            data = line[6:]  # Remove 'data: ' prefix
-                            try:
-                                chunk = json.loads(data)
-                                # Pass through the chunk with minimal modifications
-                                yield chunk
-                            except json.JSONDecodeError as e:
-                                logger.warning(f"Failed to parse JSON from line: {data}. Error: {str(e)}")
-                                # Yield error information but continue processing
-                                yield {
-                                    "error": f"JSON parse error: {str(e)}",
-                                    "data": data,
-                                    "is_task_complete": False,
-                                    "parts": [
-                                        {
-                                            "type": "text",
-                                            "text": f"Error parsing response: {str(e)}",
-                                        }
-                                    ],
-                                    "metadata": {},
-                                }
-                        else:
-                            # Log other lines for debugging
-                            logger.debug(f"Received non-data line: {line}")
-
-                            # If it looks like a raw text response (not SSE format), wrap it
-                            if not line.startswith("event:") and not line.startswith(":"):
-                                yield {"content": line, "is_task_complete": False}
-                    except UnicodeDecodeError as e:
-                        logger.warning(f"Failed to decode line: {str(e)}")
-                        # Continue processing despite decode errors
-
-        except requests.exceptions.Timeout as e:
-            error_msg = f"Request timed out after {timeout} seconds: {str(e)}"
-            logger.error(error_msg)
-            yield {
-                "content": error_msg,
-                "parts": [{"type": "text", "text": error_msg}],
-                "is_task_complete": True,
-                "error": "timeout",
-                "metadata": {"error": True},
-            }
-
-        except requests.exceptions.ChunkedEncodingError as e:
-            error_msg = f"Stream was interrupted: {str(e)}"
-            logger.error(error_msg)
-            yield {
-                "content": error_msg,
-                "parts": [{"type": "text", "text": error_msg}],
-                "is_task_complete": True,
-                "error": "stream_interrupted",
-                "metadata": {"error": True},
-            }
-
-        except requests.exceptions.ConnectionError as e:
-            error_msg = f"Connection error: {str(e)}"
-            logger.error(error_msg)
-            yield {
-                "content": error_msg,
-                "parts": [{"type": "text", "text": error_msg}],
-                "is_task_complete": True,
-                "error": "connection_error",
-                "metadata": {"error": True},
-            }
-
-        except requests.exceptions.RequestException as e:
-            error_msg = f"Error connecting to MindsDB streaming API: {str(e)}"
-            logger.error(error_msg)
-            yield {
-                "content": error_msg,
-                "parts": [{"type": "text", "text": error_msg}],
-                "is_task_complete": True,
-                "error": "request_error",
-                "metadata": {"error": True},
-            }
-
-        except Exception as e:
-            error_msg = f"Error in streaming: {str(e)}"
-            logger.error(error_msg)
-            yield {
-                "content": error_msg,
-                "parts": [{"type": "text", "text": error_msg}],
-                "is_task_complete": True,
-                "error": "unknown_error",
-                "metadata": {"error": True},
-            }
-
-        # Send a final completion message
-        yield {"is_task_complete": True, "metadata": {"complete": True}}
+    async def streaming_invoke(self, messages, timeout=DEFAULT_STREAM_TIMEOUT):
+        url = f"{self.base_url}/api/projects/{self.project_name}/agents/{self.agent_name}/completions/stream"
+        logger.debug(f"Sending streaming request to MindsDB agent: {self.agent_name}")
+        async with httpx.AsyncClient(timeout=timeout, headers=self.headers) as client:
+            async with client.stream("POST", url, json={"messages": to_serializable(messages)}) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.strip():
+                        continue
+                    # Only process actual SSE data lines
+                    if line.startswith("data:"):
+                        payload = line[len("data:") :].strip()
+                        try:
+                            yield json.loads(payload)
+                        except Exception as e:
+                            logger.exception(f"Failed to parse SSE JSON payload: {e}; line: {payload}")
+                    # Ignore comments or control lines
+                # Signal the end of the stream
+                yield {"is_task_complete": True}
 
     async def stream(
         self,
         query: str,
         session_id: str,
         history: List[dict] | None = None,
+        timeout: int = DEFAULT_STREAM_TIMEOUT,
     ) -> AsyncIterable[Dict[str, Any]]:
-        """Stream responses from the MindsDB agent (uses streaming API endpoint).
-
-        Args:
-            query: The current query to send to the agent.
-            session_id: Unique identifier for the conversation session.
-            history: Optional list of previous messages in the conversation.
-
-        Returns:
-            AsyncIterable yielding chunks of the streaming response.
-        """
+        """Stream responses from the MindsDB agent (uses streaming API endpoint)."""
         try:
-            logger.info(f"Using streaming API for query: {query[:100]}...")
-
-            # Start with history if provided, otherwise empty list
-            messages = history or []
-
-            # Add the current query to the messages
-            messages.append({"question": query, "answer": None})
-
-            # Use the streaming_invoke method to get real streaming responses
-            streaming_response = self.streaming_invoke(messages)
-
-            # Yield all chunks directly from the streaming response
-            for chunk in streaming_response:
-                # Only add required fields if they don't exist
-                # This preserves the original structure as much as possible
-                if "is_task_complete" not in chunk:
-                    chunk["is_task_complete"] = False
-
-                if "metadata" not in chunk:
-                    chunk["metadata"] = {}
-
-                # Ensure parts exist, but try to preserve original content
-                if "parts" not in chunk:
-                    # If content exists, create a part from it
-                    if "content" in chunk:
-                        chunk["parts"] = [{"type": "text", "text": chunk["content"]}]
-                    # If output exists, create a part from it
-                    elif "output" in chunk:
-                        chunk["parts"] = [{"type": "text", "text": chunk["output"]}]
-                    # If actions exist, create empty parts
-                    elif "actions" in chunk or "steps" in chunk or "messages" in chunk:
-                        # These chunks have their own format, just add empty parts
-                        chunk["parts"] = []
-                    else:
-                        # Skip chunks with no content
-                        continue
-
-                yield chunk
-
+            # Create A2A message structure with history and current query
+            a2a_message = {"role": "user", "parts": [{"text": query}]}
+            if history:
+                a2a_message["history"] = history
+            # Convert to Q&A format using centralized utility
+            formatted_messages = convert_a2a_message_to_qa_format(a2a_message)
+            logger.debug(f"Formatted messages for agent: {formatted_messages}")
+            streaming_response = self.streaming_invoke(formatted_messages, timeout=timeout)
+            async for chunk in streaming_response:
+                content_value = chunk.get("text") or chunk.get("output") or json.dumps(chunk)
+                wrapped_chunk = {"is_task_complete": False, "content": content_value, "metadata": {}}
+                yield wrapped_chunk
         except Exception as e:
-            logger.error(f"Error in streaming: {str(e)}")
+            logger.exception(f"Error in streaming: {e}")
             yield {
                 "is_task_complete": True,
                 "parts": [
                     {
                         "type": "text",
-                        "text": f"Error: {str(e)}",
+                        "text": f"Error: {e}",
                     }
                 ],
                 "metadata": {

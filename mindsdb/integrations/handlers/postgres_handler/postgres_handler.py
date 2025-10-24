@@ -1,7 +1,6 @@
-import csv
-import io
 import time
 import json
+import logging
 from typing import Optional, Any
 
 import pandas as pd
@@ -60,6 +59,7 @@ def _map_type(internal_type_name: str | None) -> MYSQL_DATA_TYPE:
         ("time", "time without time zone", "time with time zone"): MYSQL_DATA_TYPE.TIME,
         ("boolean",): MYSQL_DATA_TYPE.BOOL,
         ("bytea",): MYSQL_DATA_TYPE.BINARY,
+        ("json", "jsonb"): MYSQL_DATA_TYPE.JSON,
     }
 
     for db_types_list, mysql_data_type in types_map.items():
@@ -83,10 +83,28 @@ def _make_table_response(result: list[tuple[Any]], cursor: Cursor) -> Response:
     description: list[PGColumn] = cursor.description
     mysql_types: list[MYSQL_DATA_TYPE] = []
     for column in description:
+        if column.type_display == "vector":
+            # 'vector' is type of pgvector extension, added here as text to not import pgvector
+            # NOTE: data returned as numpy array
+            mysql_types.append(MYSQL_DATA_TYPE.VECTOR)
+            continue
         pg_type_info: TypeInfo = pg_types.get(column.type_code)
         if pg_type_info is None:
-            logger.warning(f"Postgres handler: unknown type: {column.type_code}")
-        regtype: str = pg_type_info.regtype if pg_type_info is not None else None
+            # postgres may return 'polymorphic type', which are not present in the pg_types
+            # list of 'polymorphic type' can be obtained:
+            # SELECT oid, typname, typcategory FROM pg_type WHERE typcategory = 'P' ORDER BY oid;
+            if column.type_code in (2277, 5078):
+                # anyarray, anycompatiblearray
+                regtype = "json"
+            else:
+                logger.warning(f"Postgres handler: unknown type: {column.type_code}")
+                mysql_types.append(MYSQL_DATA_TYPE.TEXT)
+                continue
+        elif pg_type_info.array_oid == column.type_code:
+            # it is any array, handle is as json
+            regtype: str = "json"
+        else:
+            regtype: str = pg_type_info.regtype if pg_type_info is not None else None
         mysql_type = _map_type(regtype)
         mysql_types.append(mysql_type)
 
@@ -129,7 +147,7 @@ class PostgresHandler(MetaDatabaseHandler):
 
         self.connection = None
         self.is_connected = False
-        self.thread_safe = False
+        self.thread_safe = True
 
     def __del__(self):
         if self.is_connected:
@@ -262,7 +280,7 @@ class PostgresHandler(MetaDatabaseHandler):
         df.columns = columns
 
     @profiler.profile()
-    def native_query(self, query: str, params=None) -> Response:
+    def native_query(self, query: str, params=None, **kwargs) -> Response:
         """
         Executes a SQL query on the PostgreSQL database and returns the result.
 
@@ -287,8 +305,19 @@ class PostgresHandler(MetaDatabaseHandler):
                     result = cur.fetchall()
                     response = _make_table_response(result, cur)
                 connection.commit()
+            except (psycopg.ProgrammingError, psycopg.DataError) as e:
+                # These is 'expected' exceptions, they should not be treated as mindsdb's errors
+                # ProgrammingError: table not found or already exists, syntax error, etc
+                # DataError: division by zero, numeric value out of range, etc.
+                # https://www.psycopg.org/psycopg3/docs/api/errors.html
+                log_message = "Database query failed with error, likely due to invalid SQL query"
+                if logger.isEnabledFor(logging.DEBUG):
+                    log_message += f". Executed query:\n{query}"
+                logger.info(log_message)
+                response = Response(RESPONSE_TYPE.ERROR, error_code=0, error_message=str(e), is_expected_error=True)
+                connection.rollback()
             except Exception as e:
-                logger.error(f"Error running query: {query} on {self.database}, {e}!")
+                logger.error(f"Error running query:\n{query}\non {self.database}, {e}")
                 response = Response(RESPONSE_TYPE.ERROR, error_code=0, error_message=str(e))
                 connection.rollback()
 
@@ -449,7 +478,10 @@ class PostgresHandler(MetaDatabaseHandler):
             AND
                 table_schema = {schema_name}
         """
-        result = self.native_query(query)
+        # If it is used by pgvector handler - `native_query` method of pgvector handler will be used
+        #   in that case if shared pgvector db is used - `native_query` will be skipped (return  empty result)
+        #   `no_restrict` flag allows to execute native query, and it will call `native_query` of postgres handler
+        result = self.native_query(query, no_restrict=True)
         result.to_columns_table_response(map_type_fn=_map_type)
         return result
 
@@ -457,7 +489,7 @@ class PostgresHandler(MetaDatabaseHandler):
         config = self._make_connection_args()
         config["autocommit"] = True
 
-        conn = psycopg.connect(connect_timeout=10, **config)
+        conn = psycopg.connect(**config)
 
         # create db trigger
         trigger_name = f"mdb_notify_{table_name}"
@@ -606,7 +638,7 @@ class PostgresHandler(MetaDatabaseHandler):
         result = self.native_query(query)
         return result
 
-    def meta_get_column_statistics(self, table_names: Optional[list] = None) -> dict:
+    def meta_get_column_statistics(self, table_names: Optional[list] = None) -> Response:
         """
         Retrieves column statistics (e.g., most common values, frequencies, null percentage, and distinct value count)
         for the specified tables or all tables if no list is provided.
@@ -615,54 +647,58 @@ class PostgresHandler(MetaDatabaseHandler):
             table_names (list): A list of table names for which to retrieve column statistics.
 
         Returns:
-            dict: A dictionary containing the column statistics.
+            Response: A response object containing the column statistics.
         """
-        query = """
+        table_filter = ""
+        if table_names is not None and len(table_names) > 0:
+            quoted_names = [f"'{t}'" for t in table_names]
+            table_filter = f" AND ps.tablename IN ({','.join(quoted_names)})"
+
+        query = (
+            """
             SELECT
-                ps.attname AS column_name,
-                ps.tablename AS table_name,
-                ps.most_common_vals AS most_common_values,
-                ps.most_common_freqs::text AS most_common_frequencies,
-                ps.null_frac * 100 AS null_percentage,
-                ps.n_distinct AS distinct_values_count,
-                ps.histogram_bounds AS histogram_bounds
+                ps.tablename AS TABLE_NAME,
+                ps.attname AS COLUMN_NAME,
+                ROUND(ps.null_frac::numeric * 100, 2) AS NULL_PERCENTAGE,
+                CASE 
+                    WHEN ps.n_distinct < 0 THEN NULL
+                    ELSE ps.n_distinct::bigint
+                END AS DISTINCT_VALUES_COUNT,
+                ps.most_common_vals AS MOST_COMMON_VALUES,
+                ps.most_common_freqs AS MOST_COMMON_FREQUENCIES,
+                ps.histogram_bounds
             FROM pg_stats ps
             WHERE ps.schemaname = current_schema()
             AND ps.tablename NOT LIKE 'pg_%'
             AND ps.tablename NOT LIKE 'sql_%'
         """
-
-        if table_names is not None and len(table_names) > 0:
-            table_names = [f"'{t}'" for t in table_names]
-            query += f" AND ps.tablename IN ({','.join(table_names)})"
+            + table_filter
+            + """
+            ORDER BY ps.tablename, ps.attname
+        """
+        )
 
         result = self.native_query(query)
-        df = result.data_frame
 
-        def parse_pg_array_string(x):
-            try:
-                return (
-                    [item.strip(" ,") for row in csv.reader(io.StringIO(x.strip("{}"))) for item in row if item.strip()]
-                    if x
-                    else []
-                )
-            except IndexError:
-                logger.error(f"Error parsing PostgreSQL array string: {x}")
-                return []
+        if result.type == RESPONSE_TYPE.TABLE and result.data_frame is not None:
+            df = result.data_frame
 
-        # Convert most_common_values and most_common_frequencies from string representation to lists.
-        df["most_common_values"] = df["most_common_values"].apply(lambda x: parse_pg_array_string(x))
-        df["most_common_frequencies"] = df["most_common_frequencies"].apply(lambda x: parse_pg_array_string(x))
+            # Extract min/max from histogram bounds
+            def extract_min_max(histogram_str):
+                if histogram_str and str(histogram_str) != "nan":
+                    clean = str(histogram_str).strip("{}")
+                    if clean:
+                        values = clean.split(",")
+                        min_val = values[0].strip(" \"'") if values else None
+                        max_val = values[-1].strip(" \"'") if values else None
+                        return min_val, max_val
+                return None, None
 
-        # Get the minimum and maximum values from the histogram bounds.
-        df["minimum_value"] = df["histogram_bounds"].apply(lambda x: parse_pg_array_string(x)[0] if x else None)
-        df["maximum_value"] = df["histogram_bounds"].apply(lambda x: parse_pg_array_string(x)[-1] if x else None)
-
-        # Handle cases where distinct_values_count is negative (indicating an approximation).
-        df["distinct_values_count"] = df["distinct_values_count"].apply(lambda x: x if x >= 0 else None)
+            min_max_values = df["histogram_bounds"].apply(extract_min_max)
+            df["MINIMUM_VALUE"] = min_max_values.apply(lambda x: x[0])
+            df["MAXIMUM_VALUE"] = min_max_values.apply(lambda x: x[1])
 
         result.data_frame = df.drop(columns=["histogram_bounds"])
-
         return result
 
     def meta_get_primary_keys(self, table_names: Optional[list] = None) -> Response:
@@ -690,8 +726,6 @@ class PostgresHandler(MetaDatabaseHandler):
             WHERE
                 tc.constraint_type = 'PRIMARY KEY'
                 AND tc.table_schema = current_schema()
-            ORDER BY
-                tc.table_name, kcu.ordinal_position
         """
 
         if table_names is not None and len(table_names) > 0:

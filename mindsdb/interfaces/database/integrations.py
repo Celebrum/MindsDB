@@ -1,5 +1,4 @@
 import os
-import sys
 import base64
 import shutil
 import ast
@@ -33,114 +32,9 @@ from mindsdb.integrations.libs.ml_exec_base import BaseMLEngineExec
 from mindsdb.integrations.libs.base import BaseHandler
 import mindsdb.utilities.profiler as profiler
 from mindsdb.interfaces.data_catalog.data_catalog_loader import DataCatalogLoader
+from mindsdb.interfaces.database.data_handlers_cache import HandlersCache
 
 logger = log.getLogger(__name__)
-
-
-class HandlersCache:
-    """Cache for data handlers that keep connections opened during ttl time from handler last use"""
-
-    def __init__(self, ttl: int = 60):
-        """init cache
-
-        Args:
-            ttl (int): time to live (in seconds) for record in cache
-        """
-        self.ttl = ttl
-        self.handlers = {}
-        self._lock = threading.RLock()
-        self._stop_event = threading.Event()
-        self.cleaner_thread = None
-
-    def __del__(self):
-        self._stop_clean()
-
-    def _start_clean(self) -> None:
-        """start worker that close connections after ttl expired"""
-        if isinstance(self.cleaner_thread, threading.Thread) and self.cleaner_thread.is_alive():
-            return
-        self._stop_event.clear()
-        self.cleaner_thread = threading.Thread(target=self._clean, name="HandlersCache.clean")
-        self.cleaner_thread.daemon = True
-        self.cleaner_thread.start()
-
-    def _stop_clean(self) -> None:
-        """stop clean worker"""
-        self._stop_event.set()
-
-    def set(self, handler: DatabaseHandler):
-        """add (or replace) handler in cache
-
-        Args:
-            handler (DatabaseHandler)
-        """
-        with self._lock:
-            try:
-                # If the handler is defined to be thread safe, set 0 as the last element of the key, otherwise set the thrad ID.
-                key = (
-                    handler.name,
-                    ctx.company_id,
-                    0 if getattr(handler, "thread_safe", False) else threading.get_native_id(),
-                )
-                handler.connect()
-                self.handlers[key] = {"handler": handler, "expired_at": time.time() + self.ttl}
-            except Exception:
-                pass
-            self._start_clean()
-
-    def get(self, name: str) -> Optional[DatabaseHandler]:
-        """get handler from cache by name
-
-        Args:
-            name (str): handler name
-
-        Returns:
-            DatabaseHandler
-        """
-        with self._lock:
-            # If the handler is not thread safe, the thread ID will be assigned to the last element of the key.
-            key = (name, ctx.company_id, threading.get_native_id())
-            if key not in self.handlers:
-                # If the handler is thread safe, a 0 will be assigned to the last element of the key.
-                key = (name, ctx.company_id, 0)
-            if key not in self.handlers or self.handlers[key]["expired_at"] < time.time():
-                return None
-            self.handlers[key]["expired_at"] = time.time() + self.ttl
-            return self.handlers[key]["handler"]
-
-    def delete(self, name: str) -> None:
-        """delete handler from cache
-
-        Args:
-            name (str): handler name
-        """
-        with self._lock:
-            key = (name, ctx.company_id, threading.get_native_id())
-            if key in self.handlers:
-                try:
-                    self.handlers[key].disconnect()
-                except Exception:
-                    pass
-                del self.handlers[key]
-            if len(self.handlers) == 0:
-                self._stop_clean()
-
-    def _clean(self) -> None:
-        """worker that delete from cache handlers that was not in use for ttl"""
-        while self._stop_event.wait(timeout=3) is False:
-            with self._lock:
-                for key in list(self.handlers.keys()):
-                    if (
-                        self.handlers[key]["expired_at"] < time.time()
-                        and sys.getrefcount(self.handlers[key]) == 2  # returned ref count is always 1 higher
-                    ):
-                        try:
-                            self.handlers[key].disconnect()
-                        except Exception:
-                            pass
-                        del self.handlers[key]
-                if len(self.handlers) == 0:
-                    self._stop_event.set()
 
 
 class IntegrationController:
@@ -161,7 +55,7 @@ class IntegrationController:
         db.session.commit()
         return integration_record.id
 
-    def add(self, name, engine, connection_args):
+    def add(self, name: str, engine, connection_args):
         logger.debug(
             "%s: add method calling name=%s, engine=%s, connection_args=%s, company_id=%s",
             self.__class__.__name__,
@@ -210,20 +104,32 @@ class IntegrationController:
         integration_record.data = data
         db.session.commit()
 
-    def delete(self, name):
-        if name in ("files", "lightwood"):
+    def delete(self, name: str, strict_case: bool = False) -> None:
+        """Delete an integration by name.
+
+        Args:
+            name (str): The name of the integration to delete.
+            strict_case (bool, optional): If True, the integration name is case-sensitive. Defaults to False.
+
+        Raises:
+            Exception: If the integration cannot be deleted (system, permanent, demo, in use, or has active models).
+
+        Returns:
+            None
+        """
+        if name == "files":
             raise Exception("Unable to drop: is system database")
 
         self.handlers_cache.delete(name)
 
         # check permanent integration
-        if name in self.handler_modules:
+        if name.lower() in self.handler_modules:
             handler = self.handler_modules[name]
 
             if getattr(handler, "permanent", False) is True:
                 raise Exception("Unable to drop permanent integration")
 
-        integration_record = self._get_integration_record(name)
+        integration_record = self._get_integration_record(name, case_sensitive=strict_case)
         if isinstance(integration_record.data, dict) and integration_record.data.get("is_demo") is True:
             raise Exception("Unable to drop demo object")
 
@@ -256,7 +162,9 @@ class IntegrationController:
 
         # Remove the integration metadata from the data catalog (if enabled).
         # TODO: Can this be handled via cascading delete in the database?
-        if Config().get("data_catalog", {}).get("enabled", False):
+        if self.get_handler_meta(integration_record.engine).get("type") == HANDLER_TYPE.DATA and Config().get(
+            "data_catalog", {}
+        ).get("enabled", False):
             data_catalog_reader = DataCatalogLoader(database_name=name)
             data_catalog_reader.unload_metadata()
 
@@ -798,7 +706,7 @@ class IntegrationController:
         for item in code.body:
             if isinstance(item, ast.ClassDef):
                 bases = [base.id for base in item.bases]
-                if "APIHandler" in bases:
+                if "APIHandler" in bases or "MetaAPIHandler" in bases:
                     return "api"
         return "sql"
 
@@ -849,6 +757,8 @@ class IntegrationController:
 
     def import_handler(self, handler_name: str, base_import: str = None):
         with self._import_lock:
+            time_before_import = time.perf_counter()
+            logger.debug(f"Importing handler '{handler_name}'")
             handler_meta = self.handlers_import_status[handler_name]
             handler_dir = handler_meta["path"]
 
@@ -860,9 +770,13 @@ class IntegrationController:
                 handler_module = importlib.import_module(f"{base_import}{handler_folder_name}")
                 self.handler_modules[handler_name] = handler_module
                 handler_meta = self._get_handler_meta(handler_name)
+                logger.debug(
+                    f"Handler '{handler_name}' imported successfully in {(time.perf_counter() - time_before_import):.3f} seconds"
+                )
             except Exception as e:
                 handler_meta["import"]["success"] = False
                 handler_meta["import"]["error_message"] = str(e)
+                logger.debug(f"Failed to import handler '{handler_name}': {e}")
 
             self.handlers_import_status[handler_meta["name"]] = handler_meta
             return handler_meta

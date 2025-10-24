@@ -2,7 +2,8 @@ import ast
 from typing import Dict, Optional, List
 
 
-from litellm import completion, batch_completion, embedding, acompletion
+from litellm import completion, batch_completion, embedding, acompletion, supports_response_schema
+
 import pandas as pd
 
 from mindsdb.integrations.libs.base import BaseMLEngine
@@ -30,26 +31,42 @@ class LiteLLMHandler(BaseMLEngine):
         if "using" not in args:
             raise Exception("Litellm engine requires a USING clause. See settings.py for more info on supported args.")
 
-    @staticmethod
-    def embeddings(model: str, messages: List[str], args: dict) -> List[list]:
+    @classmethod
+    def prepare_arguments(cls, provider, model_name, args):
+        if provider == "snowflake" and "snowflake_account_id" in args:
+            args["api_base"] = (
+                f"https://{args['snowflake_account_id']}.snowflakecomputing.com/api/v2/cortex/inference:complete"
+            )
+        if provider == "google":
+            provider = "gemini"
+        if "base_url" in args:
+            args["api_base"] = args.pop("base_url")
+
+        model_name = f"{provider}/{model_name}"
+        return model_name, args
+
+    @classmethod
+    def embeddings(cls, provider: str, model: str, messages: List[str], args: dict) -> List[list]:
+        model, args = cls.prepare_arguments(provider, model, args)
         response = embedding(model=model, input=messages, **args)
         return [rec["embedding"] for rec in response.data]
 
-    @staticmethod
-    async def acompletion(model: str, messages: List[dict], args: dict):
-        if model.startswith("snowflake/") and "snowflake_account_id" in args:
-            args["api_base"] = (
-                f"https://{args['snowflake_account_id']}.snowflakecomputing.com/api/v2/cortex/inference:complete"
-            )
-
+    @classmethod
+    async def acompletion(cls, provider: str, model: str, messages: List[dict], args: dict):
+        model, args = cls.prepare_arguments(provider, model, args)
         return await acompletion(model=model, messages=messages, stream=False, **args)
 
-    @staticmethod
-    def completion(model: str, messages: List[dict], args: dict):
-        if model.startswith("snowflake/") and "snowflake_account_id" in args:
-            args["api_base"] = (
-                f"https://{args['snowflake_account_id']}.snowflakecomputing.com/api/v2/cortex/inference:complete"
-            )
+    @classmethod
+    def completion(cls, provider: str, model: str, messages: List[dict], args: dict):
+        model, args = cls.prepare_arguments(provider, model, args)
+        json_output = args.pop("json_output", False)
+
+        supports_json_output = supports_response_schema(model=model, custom_llm_provider=provider)
+
+        if json_output and supports_json_output:
+            args["response_format"] = {"type": "json_object"}
+        else:
+            args["response_format"] = None
 
         return completion(model=model, messages=messages, stream=False, **args)
 
@@ -70,6 +87,7 @@ class LiteLLMHandler(BaseMLEngine):
 
         # check engine_storage for api_key
         input_args.update({k: v for k, v in ml_engine_args.items()})
+        input_args["target"] = target
 
         # validate args
         export_args = CompletionParameters(**input_args).model_dump()
@@ -87,6 +105,8 @@ class LiteLLMHandler(BaseMLEngine):
         # validate args
         args = CompletionParameters(**input_args).model_dump()
 
+        target = args.pop("target")
+
         # build messages
         self._build_messages(args, df)
 
@@ -96,12 +116,12 @@ class LiteLLMHandler(BaseMLEngine):
         if len(args["messages"]) > 1:
             # if more than one message, use batch completion
             responses = batch_completion(**args)
-            return pd.DataFrame({"result": [response.choices[0].message.content for response in responses]})
+            return pd.DataFrame({target: [response.choices[0].message.content for response in responses]})
 
         # run completion
         response = completion(**args)
 
-        return pd.DataFrame({"result": [response.choices[0].message.content]})
+        return pd.DataFrame({target: [response.choices[0].message.content]})
 
     @staticmethod
     def _prompt_to_messages(prompt: str, **kwargs) -> List[Dict]:

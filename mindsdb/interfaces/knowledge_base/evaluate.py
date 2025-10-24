@@ -1,14 +1,17 @@
 import json
 import math
+import re
 import time
+import copy
 from typing import List
 
 import pandas as pd
 import datetime as dt
 
 from mindsdb.api.executor.sql_query.result_set import ResultSet
-from mindsdb_sql_parser import Identifier, Select, Constant, Star, parse_sql
+from mindsdb_sql_parser import Identifier, Select, Constant, Star, parse_sql, BinaryOperation
 from mindsdb.utilities import log
+from mindsdb.utilities.config import config
 
 from mindsdb.interfaces.knowledge_base.llm_client import LLMClient
 
@@ -16,15 +19,15 @@ logger = log.getLogger(__name__)
 
 
 GENERATE_QA_SYSTEM_PROMPT = """
-Your task is to generate question and answer pairs for a search engine. 
+Your task is to generate question and answer pairs for a search engine.
 The search engine will take your query and return a list of documents.
 You will be given a text and you need to generate a question that can be answered using the information in the text.
 Your questions will be used to evaluate the search engine.
-Question should always have enough clues to identify the specific text that this question is generated from. 
+Question should always have enough clues to identify the specific text that this question is generated from.
 Never ask questions like "What license number is associated with Amend 6" because Amend 6 could be found in many documents and the question is not specific enough.
-Example output 1:  {\"query\": \"What processor does the HP 2023 14\" FHD IPS Laptop use?\", \"reference_answer\": \"Ryzen 3 5300U\"} 
+Example output 1:  {\"query\": \"What processor does the HP 2023 14\" FHD IPS Laptop use?\", \"reference_answer\": \"Ryzen 3 5300U\"}
 Example output 2: {\"query\": \"What is the name of the river in Paris?\", \"reference_answer\": \"Seine\"}
-Don't generate questions like "What is being amended in the application?" because these questions cannot be answered using the text and without knowing which document it refers to. 
+Don't generate questions like "What is being amended in the application?" because these questions cannot be answered using the text and without knowing which document it refers to.
 The question should be answerable without the text, but the answer should be present in the text.
 Return ONLY a json response. No other text.
 """
@@ -41,6 +44,39 @@ def calc_entropy(values: List[float]) -> float:
     values = [i / total for i in values if i > 0]
     # calc
     return -sum([pk * math.log(pk) for pk in values])
+
+
+def sanitize_json_response(response: str) -> str:
+    """Remove markdown code block formatting from JSON response and extract valid JSON."""
+    if not response or not response.strip():
+        raise ValueError("Empty response provided.")
+
+    # Remove leading/trailing whitespace
+    response = response.strip()
+
+    # Remove markdown code block markers if present
+    response = re.sub(r"^```(?:json|JSON)?\s*", "", response, flags=re.MULTILINE)
+    response = re.sub(r"\s*```$", "", response, flags=re.MULTILINE)
+    response = response.strip()
+
+    # Find the first opening brace
+    start_idx = response.find("{")
+    if start_idx == -1:
+        raise ValueError("No JSON object found in the response.")
+
+    # Try to parse JSON starting from first { with increasing end positions
+    # This handles nested objects and strings with braces correctly
+    for end_idx in range(len(response), start_idx, -1):  # Start from end and work backwards
+        candidate = response[start_idx:end_idx]
+        try:
+            parsed = json.loads(candidate)
+            # Ensure it's a dictionary (object) not just any valid JSON
+            if isinstance(parsed, dict):
+                return candidate
+        except json.JSONDecodeError:
+            continue
+
+    raise ValueError("No valid JSON object found in the response.")
 
 
 class EvaluateBase:
@@ -71,7 +107,12 @@ class EvaluateBase:
         if llm_params is None:
             llm_params = self.kb._kb.params.get("reranking_model")
 
-        self.llm_client = LLMClient(llm_params)
+        params = copy.deepcopy(config.get("default_llm", {}))
+
+        if llm_params:
+            params.update(llm_params)
+
+        self.llm_client = LLMClient(params)
 
     def generate_test_data(self, gen_params: dict) -> pd.DataFrame:
         # Extract source data (from users query or from KB itself) and call `generate` to get test data
@@ -84,13 +125,14 @@ class EvaluateBase:
 
             dn, table_name = self._get_dn_table(query.from_table)
             query.from_table = table_name
-            query.limit = Constant(self.DEFAULT_SAMPLE_SIZE)
+            if query.limit is None:
+                query.limit = Constant(self.DEFAULT_SAMPLE_SIZE)
 
             response = dn.query(query=query, session=self.session)
             df = response.data_frame
 
             if "content" not in df.columns:
-                raise ValueError("`content` column isn't found in source data")
+                raise ValueError(f"`content` column isn't found in provided sql: {gen_params['from_sql']}")
 
             df.rename(columns={"content": "chunk_content"}, inplace=True)
         else:
@@ -130,6 +172,8 @@ class EvaluateBase:
         integration_name = table_name.parts[0]
         table_name = Identifier(parts=table_name.parts[1:])
         dn = self.session.datahub.get(integration_name)
+        if dn is None:
+            raise ValueError(f"Can't find database: {integration_name}")
         return dn, table_name
 
     def save_to_table(self, table_name: Identifier, df: pd.DataFrame, is_replace=False):
@@ -168,14 +212,15 @@ class EvaluateBase:
             test_data = self.generate_test_data(gen_params)
 
             self.save_to_table(test_table, test_data, is_replace=True)
-        else:
-            test_data = self.read_from_table(test_table)
 
         if params.get("evaluate", True) is False:
             # no evaluate is required
             return pd.DataFrame()
 
+        test_data = self.read_from_table(test_table)
+
         scores = self.evaluate(test_data)
+        scores["id"] = math.floor(time.time())  # unique ID for the evaluation run
         scores["name"] = self.name
         scores["created_at"] = dt.datetime.now()
 
@@ -184,7 +229,7 @@ class EvaluateBase:
             to_table = params["save_to"]
             if isinstance(to_table, str):
                 to_table = Identifier(to_table)
-            self.save_to_table(to_table, scores)
+            self.save_to_table(to_table, scores.copy())
 
         return scores
 
@@ -202,6 +247,26 @@ class EvaluateBase:
             raise NotImplementedError(f"Version of evaluator is not implemented: {evaluate_version}")
 
         return cls(session, kb_table).run_evaluate(params)
+
+    def generate_question_answer(self, text: str) -> (str, str):
+        messages = [
+            {"role": "system", "content": GENERATE_QA_SYSTEM_PROMPT},
+            {"role": "user", "content": f"\n\nText:\n{text}\n\n"},
+        ]
+        answer = self.llm_client.completion(messages, json_output=True)[0]
+
+        # Sanitize the response by removing markdown code block formatting like ```json
+        sanitized_answer = sanitize_json_response(answer)
+
+        try:
+            output = json.loads(sanitized_answer)
+        except json.JSONDecodeError:
+            raise ValueError(f"Could not parse response from LLM: {answer}")
+
+        if "query" not in output or "reference_answer" not in output:
+            raise ValueError("Cant find question/answer in LLM response")
+
+        return output.get("query"), output.get("reference_answer")
 
 
 class EvaluateRerank(EvaluateBase):
@@ -230,24 +295,12 @@ class EvaluateRerank(EvaluateBase):
         df["id"] = df.index
         return df
 
-    def generate_question_answer(self, text: str) -> (str, str):
-        messages = [
-            {"role": "system", "content": GENERATE_QA_SYSTEM_PROMPT},
-            {"role": "user", "content": f"\n\nText:\n{text}\n\n"},
-        ]
-        answer = self.llm_client.completion(messages)
-        try:
-            output = json.loads(answer)
-        except json.JSONDecodeError:
-            raise ValueError(f"Could not parse response from LLM: {answer}")
-
-        if "query" not in output or "reference_answer" not in output:
-            raise ValueError("Cant find question/answer in LLM response")
-
-        return output.get("query"), output.get("reference_answer")
-
     def evaluate(self, test_data: pd.DataFrame) -> pd.DataFrame:
         json_to_log_list = []
+        if {"question", "answer"} - set(test_data.columns):
+            raise KeyError(
+                f'Test data must contain "question" and "answer" columns. Columns in the provided test data: {list(test_data.columns)}'
+            )
         questions = test_data.to_dict("records")
 
         for i, item in enumerate(questions):
@@ -256,7 +309,13 @@ class EvaluateRerank(EvaluateBase):
 
             start_time = time.time()
             logger.debug(f"Querying [{i + 1}/{len(questions)}]: {question}")
-            df_answers = self.kb.select_query(Select(targets=[Identifier("chunk_content")], limit=Constant(self.TOP_K)))
+            df_answers = self.kb.select_query(
+                Select(
+                    targets=[Identifier("chunk_content")],
+                    where=BinaryOperation(op="=", args=[Identifier("content"), Constant(question)]),
+                    limit=Constant(self.TOP_K),
+                )
+            )
             query_time = time.time() - start_time
 
             proposed_responses = list(df_answers["chunk_content"])
@@ -410,7 +469,7 @@ class EvaluateDocID(EvaluateBase):
     Checks if ID in response from KB is matched with doc ID in test dataset
     """
 
-    TOP_K = 100
+    TOP_K = 20
 
     def generate(self, sampled_df: pd.DataFrame) -> pd.DataFrame:
         if "id" not in sampled_df.columns:
@@ -435,24 +494,12 @@ class EvaluateDocID(EvaluateBase):
         df = pd.DataFrame(qa_data)
         return df
 
-    def generate_question_answer(self, text: str) -> (str, str):
-        messages = [
-            {"role": "system", "content": GENERATE_QA_SYSTEM_PROMPT},
-            {"role": "user", "content": f"\n\nText:\n{text}\n\n"},
-        ]
-        answer = self.llm_client.completion(messages)
-        try:
-            output = json.loads(answer)
-        except json.JSONDecodeError:
-            raise ValueError(f"Could not parse response from LLM: {answer}")
-
-        if "query" not in output or "reference_answer" not in output:
-            raise ValueError("Cant find question/answer in LLM response")
-
-        return output.get("query"), output.get("reference_answer")
-
     def evaluate(self, test_data: pd.DataFrame) -> pd.DataFrame:
         stats = []
+        if {"question", "doc_id"} - set(test_data.columns):
+            raise KeyError(
+                f'Test data must contain "question" and "doc_id" columns. Columns in the provided test data: {list(test_data.columns)}'
+            )
         questions = test_data.to_dict("records")
 
         for i, item in enumerate(questions):
@@ -462,7 +509,11 @@ class EvaluateDocID(EvaluateBase):
             start_time = time.time()
             logger.debug(f"Querying [{i + 1}/{len(questions)}]: {question}")
             df_answers = self.kb.select_query(
-                Select(targets=[Identifier("chunk_content"), Identifier("id")], limit=Constant(self.TOP_K))
+                Select(
+                    targets=[Identifier("chunk_content"), Identifier("id")],
+                    where=BinaryOperation(op="=", args=[Identifier("content"), Constant(question)]),
+                    limit=Constant(self.TOP_K),
+                )
             )
             query_time = time.time() - start_time
 
@@ -492,8 +543,6 @@ class EvaluateDocID(EvaluateBase):
         total_questions = len(stats)
         total_found = sum([1 for stat in stats if stat["doc_found"]])
 
-        total_accurately_retrieved = sum([1 for stat in stats if stat["doc_found"]])
-
         accurate_in_top_10 = sum([1 for stat in stats if stat["doc_found"] and stat["doc_position"] < 10])
 
         # calculate recall curve by position
@@ -512,8 +561,7 @@ class EvaluateDocID(EvaluateBase):
         return {
             "total": total_questions,
             "total_found": total_found,
-            "retrieved_in_top_k": total_accurately_retrieved,
             "retrieved_in_top_10": accurate_in_top_10,
-            "cumulative_recall": cumulative_recall,
+            "cumulative_recall": json.dumps(cumulative_recall),
             "avg_query_time": avg_query_time,
         }

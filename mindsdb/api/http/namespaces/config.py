@@ -11,6 +11,7 @@ from flask import current_app as ca
 from mindsdb.api.http.namespaces.configs.config import ns_conf
 from mindsdb.api.http.utils import http_error
 from mindsdb.metrics.metrics import api_endpoint_metrics
+from mindsdb.utilities.api_status import get_api_status
 from mindsdb.utilities import log
 from mindsdb.utilities.functions import decrypt, encrypt
 from mindsdb.utilities.config import Config
@@ -28,10 +29,17 @@ class GetConfig(Resource):
     def get(self):
         config = Config()
         resp = {"auth": {"http_auth_enabled": config["auth"]["http_auth_enabled"]}}
-        for key in ["default_llm", "default_embedding_model", "default_reranking_model", "a2a"]:
+        for key in ["default_llm", "default_embedding_model", "default_reranking_model"]:
             value = config.get(key)
             if value is not None:
                 resp[key] = value
+
+        api_status = get_api_status()
+        api_configs = copy.deepcopy(config["api"])
+        for api_name, api_config in api_configs.items():
+            api_config["running"] = api_status.get(api_name, False)
+        resp["api"] = api_configs
+
         return resp
 
     @ns_conf.doc("put_config")
@@ -52,6 +60,15 @@ class GetConfig(Resource):
                     return http_error(
                         HTTPStatus.BAD_REQUEST, "Wrong arguments", f"Unknown argumens: {unknown_arguments}"
                     )
+
+        overwrite_arguments = {"default_llm", "default_embedding_model", "default_reranking_model"}
+        overwrite_data = {k: data[k] for k in overwrite_arguments if k in data}
+        merge_data = {k: data[k] for k in data if k not in overwrite_arguments}
+
+        if len(overwrite_data) > 0:
+            Config().update(overwrite_data, overwrite=True)
+        if len(merge_data) > 0:
+            Config().update(merge_data)
 
         Config().update(data)
 
@@ -154,9 +171,7 @@ class Integration(Resource):
             )
 
         try:
-            engine = params["type"]
-            if engine is not None:
-                del params["type"]
+            engine = params.pop("type", None)
             params.pop("publish", False)
             storage = params.pop("storage", None)
             ca.integration_controller.add(name, engine, params)
@@ -169,10 +184,10 @@ class Integration(Resource):
                 handler.handler_storage.import_files(export)
 
         except Exception as e:
-            logger.error(str(e))
+            logger.exception("An error occurred during the creation of the integration:")
             if temp_dir is not None:
                 shutil.rmtree(temp_dir)
-            return http_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Error", f"Error during config update: {str(e)}")
+            return http_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Error", f"Error during config update: {e}")
 
         if temp_dir is not None:
             shutil.rmtree(temp_dir)
@@ -189,8 +204,8 @@ class Integration(Resource):
         try:
             ca.integration_controller.delete(name)
         except Exception as e:
-            logger.error(str(e))
-            return http_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Error", f"Error during integration delete: {str(e)}")
+            logger.exception("An error occurred while deleting the integration")
+            return http_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Error", f"Error during integration delete: {e}")
         return "", 200
 
     @ns_conf.doc("modify_integration")
@@ -214,8 +229,6 @@ class Integration(Resource):
             ca.integration_controller.modify(name, params)
 
         except Exception as e:
-            logger.error(str(e))
-            return http_error(
-                HTTPStatus.INTERNAL_SERVER_ERROR, "Error", f"Error during integration modification: {str(e)}"
-            )
+            logger.exception("An error occurred while modifying the integration")
+            return http_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Error", f"Error during integration modification: {e}")
         return "", 200
